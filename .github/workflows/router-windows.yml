@@ -1,0 +1,60 @@
+# Fork-only workflow: builds the Windows x64 app from the router-cam branch.
+#
+# This is a personal test build of a fork for one machine, not a SolidCraft release. The build is
+# unsigned and is kept as a workflow artifact, not published as a release (see LICENSE-BRAND:
+# a modified build is not handed to others under the SolidCraft name).
+#
+# The steps mirror the `windows` job of release.yml for x64 only. On x64 the packaging script
+# draws the app icon with the CLI it has just built, so the separate icons job is not needed.
+name: Router CAM Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [router-cam]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: router-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: router-windows-x64
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
+      - name: Version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $m = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          if (-not $m) { throw 'no workspace version in Cargo.toml' }
+          $v = $m.Matches[0].Groups[1].Value
+          "SOLIDCRAFT_VERSION=$v-router.$env:GITHUB_RUN_NUMBER" >> $env:GITHUB_ENV
+      - name: Build and package (msi, portable zip)
+        shell: pwsh
+        run: ./packaging/windows/package.ps1 -Arch x64
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: router-cam-windows-x64
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 30
