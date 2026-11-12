@@ -5,7 +5,7 @@
 
 use serde_json::{Value, json};
 use solidcore_record::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
-use solidcraft_cam::router::auto::{Hold, PartCut, Planned, plan_part};
+use solidcraft_cam::router::auto::{PartCut, Planned, plan_part};
 use solidcraft_cam::router::feeds::{CutKind, FeedRequest, Material, Tier, recipe};
 use solidcraft_cam::router::{Issue, MachineProfile, Severity, check_program, check_text, check_travel};
 use solidcraft_cam::{
