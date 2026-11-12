@@ -104,6 +104,17 @@ impl MachineProfile {
         }
     }
 
+    /// The names [`MachineProfile::builtin`] knows.
+    pub const BUILTIN: &'static [&'static str] = &["flexihal-router"];
+
+    /// The built-in machine called `name`.
+    pub fn builtin(name: &str) -> Option<MachineProfile> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "flexihal-router" | "flexihal" => Some(MachineProfile::flexihal_router()),
+            _ => None,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() || self.name.len() > 64 || self.name.chars().any(char::is_control) {
             return invalid("a machine's name must be 1 to 64 printable characters");

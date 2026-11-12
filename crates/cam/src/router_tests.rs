@@ -343,7 +343,10 @@ fn hostile_machines_and_requests_are_errors_never_panics() {
         let _ = check_text(text, &good).unwrap();
     }
     assert_eq!(check_text("G53G0Z0", &good).unwrap().len(), 1);
-    // Profiles are data.
+    // Profiles are data, and the built-in ones are sound.
+    assert_eq!(MachineProfile::builtin(" FlexiHAL-Router "), Some(machine()));
+    assert!(MachineProfile::BUILTIN.iter().all(|n| MachineProfile::builtin(n).is_some_and(|m| m.validate().is_ok() && m.name == *n)));
+    assert_eq!(MachineProfile::builtin("lathe"), None);
     let json = serde_json::to_string(&good).unwrap();
     assert_eq!(serde_json::from_str::<MachineProfile>(&json).unwrap(), good);
     let _ = PI;
