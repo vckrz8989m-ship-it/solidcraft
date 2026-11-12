@@ -235,15 +235,37 @@ impl Post {
         }
     }
 
+    /// grblHAL on a 3-axis machine, written from grblHAL's own documentation (the core wiki's
+    /// "Additional G and M codes" and tool change pages, and Grbl 1.1's supported codes): no
+    /// cutter compensation word (`G40` is all it knows, and it is the power-on state), no tool
+    /// length words (`G43 H` needs a tool table most builds do not have, and `G49` would cancel
+    /// the offset the controller keeps across its own tool changes), coordinates to a micron,
+    /// and a manual tool change: spindle off, a comment naming the tool, and a pause (`M0`) for
+    /// the operator, after which the spindle starts again. A machine adds its own safe retract
+    /// and spindle run-up time ([`crate::router::MachineProfile::post`]).
+    pub fn grblhal() -> Post {
+        Post {
+            name: "grblhal".into(),
+            extension: "nc".into(),
+            decimals: 3,
+            feed_decimals: 0,
+            header: lines(&["G90 G94 G17 {units}", "{work_offset}"]),
+            tool_change: lines(&["M5", "(change to tool {tool}, diameter {diameter})", "M0"]),
+            tool_change_first: false,
+            ..Post::rs274()
+        }
+    }
+
     /// The built-in post called `name`.
     pub fn builtin(name: &str) -> Option<Post> {
         match name.trim().to_ascii_lowercase().as_str() {
+            "grblhal" | "grbl" => Some(Post::grblhal()),
             "rs274" | "linuxcnc" => Some(Post::rs274()),
             _ => None,
         }
     }
 
-    pub const BUILTIN: &'static [&'static str] = &["rs274"];
+    pub const BUILTIN: &'static [&'static str] = &["grblhal", "rs274"];
 
     /// Whether the post writes the work offset (a `{work_offset}` in its header, tool change or
     /// operation start).

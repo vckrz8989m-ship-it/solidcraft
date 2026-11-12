@@ -100,6 +100,7 @@ pub mod rapids;
 mod readback;
 pub mod readback5;
 pub mod rotary;
+pub mod router;
 pub mod stock;
 pub mod stop;
 mod surface;
@@ -192,6 +193,8 @@ mod machine_time_tests;
 mod rapids_tests;
 #[cfg(test)]
 mod rotary_tests;
+#[cfg(test)]
+mod router_tests;
 #[cfg(test)]
 mod stock_tests;
 #[cfg(test)]
