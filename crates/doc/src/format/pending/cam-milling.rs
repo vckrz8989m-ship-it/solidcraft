@@ -1,4 +1,5 @@
-//! A design can hold CAM milling data (`cam`: tools, setups, and 2D contour/pocket operations).
+//! A design can hold CAM milling data (`cam`: tools, setups, and 2D contour, pocket and
+//! whole-part operations; a part's cuts and holding tabs are planned when posting and are not saved).
 //! A setup is an ISO 841 work frame in the model (`work_origin`, `tool_axis`, optional `x_axis`)
 //! plus an RS-274 work offset (`G54`…`G59`) and an optional stock box. Sketch and face geometry
 //! is mapped into that frame when posting; explicit polylines are already work XY. Depths, feeds

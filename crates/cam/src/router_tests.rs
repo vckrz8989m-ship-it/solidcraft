@@ -1,7 +1,9 @@
 use std::f64::consts::PI;
 
 use solidcore_record::{Loop2, Region2, Vec2, Vec3};
+use solidcraft_geom::prelude::*;
 
+use crate::router::auto::{Hold, PartCut, plan_part};
 use crate::router::feeds::{CutKind, FeedRequest, Material, Recipe, Tier, chip_thinning, recipe};
 use crate::router::{MachineProfile, Severity, check_program, check_text, check_travel};
 use crate::*;
@@ -350,4 +352,134 @@ fn hostile_machines_and_requests_are_errors_never_panics() {
     let json = serde_json::to_string(&good).unwrap();
     assert_eq!(serde_json::from_str::<MachineProfile>(&json).unwrap(), good);
     let _ = PI;
+}
+
+fn one_flute(diameter: f64) -> Tool {
+    let mut tool = Tool::new(1, ToolKind::FlatEndmill, diameter, 17.0);
+    tool.flutes = 1;
+    tool
+}
+
+/// A 60 × 40 mm plate with round openings, each given as centre x, centre y and radius.
+fn plate_with(holes: &[(f64, f64, f64)]) -> [Region2; 1] {
+    [Region2 {
+        outer: Loop2::polygon(&[v(0.0, 0.0), v(60.0, 0.0), v(60.0, 40.0), v(0.0, 40.0)]),
+        holes: holes.iter().map(|&(x, y, r)| Loop2::circle(v(x, y), r).reversed()).collect(),
+    }]
+}
+
+#[test]
+fn a_part_is_planned_openings_first_and_its_outside_last() {
+    let m = machine();
+    let tool = one_flute(6.0);
+    let plan = plan_part(&plate_with(&[(30.0, 20.0, 10.0)]), &tool, &PartCut::new(Material::Aluminum, 6.0), &m).unwrap();
+    let names: Vec<&str> = plan.operations.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(names, ["Opening 1 rough", "Opening 1 finish", "Outside rough", "Outside finish"]);
+    // Tabs hold the part, so there is nothing to warn of: three round this outline, 1 mm high,
+    // left by the last roughing pass and by the finishing pass.
+    assert_eq!(plan.issues, []);
+    let tabs = |op: &Operation| {
+        let on_tab: Vec<bool> = op.path.points(0.01).iter().filter(|(_, cutting)| *cutting).map(|(p, _)| (p.z + 5.2).abs() < 1e-6).collect();
+        on_tab.windows(2).filter(|w| !w[0] && w[1]).count()
+    };
+    assert_eq!((tabs(&plan.operations[2]), tabs(&plan.operations[3])), (3, 3));
+    assert_eq!((tabs(&plan.operations[0]), tabs(&plan.operations[1])), (0, 0));
+    // Without them the plan says the part comes loose, and cuts all the way round at the bottom.
+    let loose =
+        plan_part(&plate_with(&[(30.0, 20.0, 10.0)]), &tool, &PartCut { hold: Hold::None, ..PartCut::new(Material::Aluminum, 6.0) }, &m).unwrap();
+    assert_eq!(loose.issues.len(), 1, "{:?}", loose.issues);
+    assert_eq!((loose.issues[0].severity, loose.issues[0].at.as_deref()), (Severity::Warning, Some("Outside")));
+    assert!(loose.issues[0].message.contains("nothing holds the part"), "{:?}", loose.issues);
+    assert_eq!(tabs(&loose.operations[3]), 0);
+
+    // Feeds and speeds are the recipes', and every cut goes through the plate by 0.2 mm.
+    let slot = recipe(&ask(6.0, 1, CutKind::Slot), &m).unwrap();
+    let finish = recipe(&ask(6.0, 1, CutKind::Finish), &m).unwrap();
+    let clear = recipe(&ask(6.0, 1, CutKind::Pocket), &m).unwrap();
+    close(plan.operations[0].spindle_rpm, clear.rpm, 1e-9);
+    close(plan.operations[2].spindle_rpm, slot.rpm, 1e-9);
+    close(plan.operations[3].spindle_rpm, finish.rpm, 1e-9);
+    for op in &plan.operations {
+        let low = op.path.points(0.01).iter().map(|(p, _)| p.z).fold(f64::INFINITY, f64::min);
+        close(low, -6.2, 1e-6);
+        let fastest = op.path.moves.iter().filter_map(|mv| if let Move::Feed { feed, .. } = mv { Some(*feed) } else { None }).fold(0.0, f64::max);
+        assert!(fastest <= slot.feed.max(finish.feed).max(clear.feed) + 1e-9, "{}: {fastest}", op.name);
+    }
+    // Roughing stays 0.2 mm off the wall the finishing pass then cuts: 3.2 and 3.0 mm from it.
+    let reach =
+        |op: &Operation| op.path.points(0.01).iter().filter(|(p, cutting)| *cutting && p.z < -1.0).map(|(p, _)| p.x).fold(f64::INFINITY, f64::min);
+    close(reach(&plan.operations[2]), -3.2, 0.01);
+    close(reach(&plan.operations[3]), -3.0, 0.01);
+
+    // The whole plan posts for the machine with nothing the machine refuses.
+    let program = Program { name: "plate".into(), operations: plan.operations, ..Program::default() };
+    let text = emit(&program, &m.post()).unwrap();
+    assert!(check_text(&text, &m).unwrap().iter().all(|i| i.severity != Severity::Error));
+    assert!(check_program(&program, &m).unwrap().iter().all(|i| i.severity != Severity::Error));
+}
+
+#[test]
+fn openings_are_cut_nearest_first_and_only_where_the_cutter_fits() {
+    let m = machine();
+    let tool = one_flute(6.0);
+    let cut = PartCut::new(Material::Aluminum, 6.0);
+    // Opening 1 is far, 2 is near, 3 is too small for the cutter, 4 has room for one pass only.
+    let part = plate_with(&[(50.0, 30.0, 5.0), (10.0, 10.0, 5.0), (30.0, 30.0, 2.5), (30.0, 10.0, 3.1)]);
+    let plan = plan_part(&part, &tool, &cut, &m).unwrap();
+    let names: Vec<&str> = plan.operations.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(names, ["Opening 2 rough", "Opening 2 finish", "Opening 4", "Opening 1 rough", "Opening 1 finish", "Outside rough", "Outside finish"]);
+    let unfit: Vec<_> = plan.issues.iter().filter(|i| i.message.contains("does not fit")).collect();
+    assert_eq!(unfit.len(), 1, "{:?}", plan.issues);
+    assert_eq!(unfit[0].at.as_deref(), Some("Opening 3"));
+    assert_eq!(unfit[0].severity, Severity::Warning);
+
+    // A plate thicker than the flutes is an error to read, and nothing is cut.
+    let thick = plan_part(&plate_with(&[]), &tool, &PartCut::new(Material::Aluminum, 20.0), &m).unwrap();
+    assert!(thick.operations.is_empty());
+    assert!(thick.issues.iter().any(|i| i.severity == Severity::Error && i.message.contains("longer cutter")), "{:?}", thick.issues);
+
+    // A sketch of a plate with a hole gives the hole's disc as a region too: it is the opening's
+    // waste, not a second part whose outside would be cut into the plate.
+    let mut drawn = plate_with(&[(30.0, 20.0, 10.0)]).to_vec();
+    drawn.push(Region2 { outer: Loop2::circle(v(30.0, 20.0), 10.0), holes: vec![] });
+    // A disc of 8 mm has no room for three tabs: it is cut without, and the plan says so.
+    let coin = [Region2 { outer: Loop2::circle(v(0.0, 0.0), 4.0), holes: vec![] }];
+    let small = plan_part(&coin, &tool, &cut, &m).unwrap();
+    assert_eq!(small.operations.len(), 2);
+    assert!(small.issues.iter().any(|i| i.message.contains("too small for holding tabs")), "{:?}", small.issues);
+
+    let from_sketch = plan_part(&drawn, &tool, &cut, &m).unwrap();
+    let alone = plan_part(&plate_with(&[(30.0, 20.0, 10.0)]), &tool, &cut, &m).unwrap();
+    assert_eq!(from_sketch, alone);
+
+    // Two parts are told apart by name, and both outsides come after every opening.
+    let mut two = plate_with(&[(30.0, 20.0, 8.0)]).to_vec();
+    two.push(Region2 { outer: Loop2::circle(v(100.0, 20.0), 15.0), holes: vec![Loop2::circle(v(100.0, 20.0), 6.0).reversed()] });
+    let plan = plan_part(&two, &tool, &cut, &m).unwrap();
+    let names: Vec<&str> = plan.operations.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(names[..4], ["Part 1 opening 1 rough", "Part 1 opening 1 finish", "Part 2 opening 1 rough", "Part 2 opening 1 finish"]);
+    assert_eq!(names[4..], ["Part 1 outside rough", "Part 1 outside finish", "Part 2 outside rough", "Part 2 outside finish"]);
+}
+
+#[test]
+fn hostile_parts_and_cuts_are_errors_never_panics() {
+    let m = machine();
+    let tool = one_flute(6.0);
+    let good = PartCut::new(Material::Aluminum, 6.0);
+    assert!(plan_part(&[], &tool, &good, &m).is_err());
+    for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0, 1.0e9] {
+        assert!(plan_part(&plate_with(&[]), &tool, &PartCut { thickness: bad, ..good }, &m).is_err(), "thickness {bad}");
+        assert!(plan_part(&plate_with(&[]), &tool, &PartCut { clearance: bad, ..good }, &m).is_err(), "clearance {bad}");
+    }
+    for bad in [f64::NAN, f64::INFINITY, -1.0, 1.0e9] {
+        assert!(plan_part(&plate_with(&[]), &tool, &PartCut { finish_stock: bad, ..good }, &m).is_err(), "stock {bad}");
+        assert!(plan_part(&plate_with(&[]), &tool, &PartCut { break_through: bad, ..good }, &m).is_err(), "through {bad}");
+        assert!(plan_part(&plate_with(&[]), &tool, &PartCut { ramp_angle: bad, ..good }, &m).is_err(), "ramp {bad}");
+        assert!(plan_part(&plate_with(&[]), &tool, &PartCut { top: bad, ..good }, &m).is_ok() == (bad == -1.0), "top {bad}");
+    }
+    // A loop that is no outline at all is refused by the cuts it would need, not a crash.
+    let nothing = [Region2 { outer: Loop2 { segs: vec![] }, holes: vec![] }];
+    assert!(plan_part(&nothing, &tool, &good, &m).is_err());
+    let many = [Region2 { outer: plate_with(&[])[0].outer.clone(), holes: vec![Loop2::circle(v(5.0, 5.0), 1.0); 2001] }];
+    assert!(plan_part(&many, &tool, &good, &m).is_err());
 }

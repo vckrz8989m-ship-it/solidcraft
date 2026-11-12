@@ -5,10 +5,11 @@
 
 use serde_json::{Value, json};
 use solidcore_record::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
+use solidcraft_cam::router::auto::{Hold, PartCut, Planned, plan_part};
 use solidcraft_cam::router::feeds::{CutKind, FeedRequest, Material, Tier, recipe};
-use solidcraft_cam::router::{MachineProfile, Severity, check_program, check_text, check_travel};
+use solidcraft_cam::router::{Issue, MachineProfile, Severity, check_program, check_text, check_travel};
 use solidcraft_cam::{
-    ContourParams, Cut, Feeds, Heights, Operation, PocketParams, Post, Program, Side, Tool, ToolKind, contour, emit, pocket, readback,
+    ContourParams, Cut, Feeds, Heights, Move, Operation, PocketParams, Post, Program, Side, Tool, ToolKind, contour, emit, pocket, readback,
 };
 use solidcraft_doc::cam::{
     CamContourParams, CamCut, CamFaceRef, CamGeometry, CamOperation, CamPocketParams, CamSettings, CamSetup, CamSide, MAX_OPS, MAX_SETUPS, MAX_TOOLS,
@@ -49,13 +50,36 @@ pub static COMMANDS: &[CommandSpec] = &[
          stepover? (default half the tool diameter); climb?; stock_to_leave?; tolerance?; ramp_angle?: deg; \
          clearance?; retract?; top?; bottom; stepdown?; feed?; plunge_feed?; spindle_rpm?; coolant?",
     ),
+    CommandSpec::new("cam.op.part", "Cut Out Part", part_cmd).icon("cut").params(
+        "setup; name; tool (number); sketch?: id or name, with profiles?; faces?; or outer/regions; holes?; \
+         material: aluminum|aluminum_soft|brass|acrylic|soft_plastic|hardwood|softwood; thickness (of the plate); \
+         tier?: careful|standard|bold (default standard); top? (the plate's top, default 0); finish_stock? (default 0.2 mm); \
+         break_through? (below the plate, default 0.2 mm); coolant?: bool (default true); \
+         hold?: tabs|none (default tabs: three to eight holding tabs are left round the outside); \
+         machine?: (default flexihal-router; what the plan is tried on, cam.post names the one it is written for) → \
+         {setup, operation, cuts: [names in cutting order], issues}. Every opening the tool fits is roughed and \
+         finished, nearest first, then the outside is, at the machine's feeds; the cuts are planned again when posting.",
+    ),
+    CommandSpec::new("cam.cut_out", "Cut Out Part to G-code", cut_out_cmd).icon("cut").params(
+        "sketch?: id or name (default the newest sketch), with profiles?; faces?; or outer/regions; holes?; \
+         material: aluminum|aluminum_soft|brass|acrylic|soft_plastic|hardwood|softwood; thickness (of the plate); \
+         tool?: number of a defined tool, or tool_diameter with flutes? (default 1) and flute_length? (default 3 diameters): \
+         a tool of that size is used, or defined under the next free number; tier?: careful|standard|bold; hold?: tabs|none; \
+         name?: the operation's (default the sketch's name); setup?: (default Router, made when missing: work zero at the \
+         sketch origin, Z 0 on the plate's top); machine?: (default flexihal-router); path?: file the G-code is written to; \
+         dry_run?: bool (plan and check only: nothing is kept in the design or written) → \
+         {setup, operation, tool, cuts: [{name, rpm, feed}] in cutting order, issues, extents, gcode, readback, path?}. One step from a drawn outline to a \
+         checked program of that part alone: the part is kept in the setup as cam.op.part would keep it.",
+    ),
     CommandSpec::new("cam.op.remove", "Remove CAM Operation", delete_op).icon("delete").params("setup; name"),
     CommandSpec::new("cam.post", "Post Process", post_cmd).icon("export").noundo().params(
         "setup; post?: grblhal | rs274 | name of a saved post (default rs274, or the machine's own); \
-         machine?: flexihal-router (its post, and its checks: spindle range, feeds and arcs it can follow, codes and \
+         machine?: flexihal-router (the default when the setup cuts out a part; its post, and its checks: spindle range, feeds and arcs it can follow, codes and \
          machine-coordinate moves its controller refuses); machine_origin?: [x,y,z] the work zero in machine coordinates \
-         (checks travel when the machine's is known); program?: name (default the setup's) → \
-         {gcode, extension, post, operations, readback, machine?, issues?}. G-code is always read back and checked \
+         (checks travel when the machine's is known); program?: name (default the setup's); \
+         path?: file the G-code is written to, once it has passed every check → \
+         {gcode, extension, post, operations, readback, extents: {min, max} of all motion in work coordinates, \
+         machine?, issues?, path?}. G-code is always read back and checked \
          against the toolpaths; with a machine, an issue that would stop the program is an error.",
     ),
     CommandSpec::new("cam.feeds", "Feeds and Speeds", feeds_cmd).icon("settings").params(
@@ -317,9 +341,15 @@ fn op_cmd(s: &mut Session, p: &Value, cmd: &str, is_contour: bool) -> Result<Val
     op.validate().map_err(|e| bad(cmd, e.to_string()))?;
     let setup = s.doc.cam.setup(&setup_name).cloned().ok_or_else(|| bad(cmd, format!("no setup `{setup_name}` (cam.setup first)")))?;
     build_path(s, &setup, &op).map_err(|e| bad(cmd, e))?;
+    store_op(s, cmd, &setup_name, op)?;
+    Ok(json!({"setup": setup_name, "operation": name}))
+}
+
+/// Puts `op` in the setup, in place of the operation of its name if there is one.
+fn store_op(s: &mut Session, cmd: &str, setup_name: &str, op: CamOperation) -> Result<()> {
     let doc = s.doc_mut();
-    let setup = doc.cam.setup_mut(&setup_name).ok_or_else(|| bad(cmd, format!("no setup `{setup_name}` (cam.setup first)")))?;
-    if let Some(slot) = setup.operations.iter_mut().find(|o| o.name() == name) {
+    let setup = doc.cam.setup_mut(setup_name).ok_or_else(|| bad(cmd, format!("no setup `{setup_name}` (cam.setup first)")))?;
+    if let Some(slot) = setup.operations.iter_mut().find(|o| o.name() == op.name()) {
         *slot = op;
     } else {
         if setup.operations.len() >= MAX_OPS {
@@ -327,7 +357,74 @@ fn op_cmd(s: &mut Session, p: &Value, cmd: &str, is_contour: bool) -> Result<Val
         }
         setup.operations.push(op);
     }
-    Ok(json!({"setup": setup_name, "operation": name}))
+    Ok(())
+}
+
+fn part_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.op.part";
+    let setup_name = str_(p, "setup").map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| bad(cmd, "`setup` is required"))?.to_string();
+    let name = str_(p, "name").map(str::trim).filter(|n| !n.is_empty() && n.len() <= 128).ok_or_else(|| bad(cmd, "`name` is required"))?.to_string();
+    let tool = num(p, "tool").filter(|n| *n >= 1.0 && n.fract() == 0.0).map(|n| n as u32).ok_or_else(|| bad(cmd, "`tool` must be a tool number"))?;
+    let cutter = s.doc.cam.tool(tool).cloned().ok_or_else(|| bad(cmd, format!("no tool {tool} (cam.tool.define first)")))?;
+    let material: Material = word(cmd, p, "material", "aluminum, aluminum_soft, brass, acrylic, soft_plastic, hardwood or softwood")?
+        .ok_or_else(|| bad(cmd, "`material` is required: aluminum, aluminum_soft, brass, acrylic, soft_plastic, hardwood or softwood"))?;
+    let tier: Tier = word(cmd, p, "tier", "careful, standard or bold")?.unwrap_or_default();
+    let machine = machine_named(cmd, str_(p, "machine").unwrap_or(DEFAULT_MACHINE))?;
+    let op = CamOperation::Part {
+        name: name.clone(),
+        tool,
+        geometry: geometry_param(s, cmd, p)?,
+        material,
+        thickness: req_expr(cmd, p, "thickness")?,
+        tier,
+        top: expr(p, "top").unwrap_or_else(|| Expr::new("0 mm")),
+        finish_stock: expr(p, "finish_stock").unwrap_or_else(|| Expr::new("0.2 mm")),
+        break_through: expr(p, "break_through").unwrap_or_else(|| Expr::new("0.2 mm")),
+        coolant: bool_(p, "coolant").unwrap_or(true),
+        hold: word(cmd, p, "hold", "tabs or none")?.unwrap_or_default(),
+    };
+    op.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    let setup = s.doc.cam.setup(&setup_name).cloned().ok_or_else(|| bad(cmd, format!("no setup `{setup_name}` (cam.setup first)")))?;
+    let plan = plan_op(s, &setup, &op, &cutter, &machine).map_err(|e| bad(cmd, e))?;
+    if let Some(stop) = plan.issues.iter().find(|i| i.severity == Severity::Error) {
+        return Err(bad(cmd, stop.message.clone()));
+    }
+    store_op(s, cmd, &setup_name, op)?;
+    Ok(json!({
+        "setup": setup_name,
+        "operation": name,
+        "cuts": plan.operations.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
+        "issues": plan.issues,
+    }))
+}
+
+/// The machine a part is planned for when none is named.
+const DEFAULT_MACHINE: &str = "flexihal-router";
+
+/// The cuts of a part operation on `machine`, named after it (`Plate: Outside rough`).
+fn plan_op(s: &Session, setup: &CamSetup, op: &CamOperation, tool: &Tool, machine: &MachineProfile) -> std::result::Result<Planned, String> {
+    let CamOperation::Part { name, geometry, material, thickness, tier, top, finish_stock, break_through, coolant, hold, .. } = op else {
+        return Err(format!("`{}` is not a part operation", op.name()));
+    };
+    let regions = resolve_geometry(s, setup, geometry)?;
+    let mut cut = PartCut::new(*material, eval_len(s, thickness, "thickness")?);
+    cut.tier = *tier;
+    cut.top = eval_len(s, top, "top")?;
+    cut.finish_stock = eval_len(s, finish_stock, "finish_stock")?;
+    cut.break_through = eval_len(s, break_through, "break_through")?;
+    cut.coolant = *coolant;
+    cut.hold = *hold;
+    let mut plan = plan_part(&regions, tool, &cut, machine).map_err(|e| e.to_string())?;
+    for o in &mut plan.operations {
+        o.name = format!("{name}: {}", o.name);
+    }
+    for i in &mut plan.issues {
+        i.at = Some(match i.at.take() {
+            Some(at) => format!("{name}: {at}"),
+            None => name.clone(),
+        });
+    }
+    Ok(plan)
 }
 
 fn parse_side(cmd: &str, side: &str) -> Result<CamSide> {
@@ -482,36 +579,83 @@ fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     if setup.operations.is_empty() {
         return Err(bad(cmd, format!("setup `{setup_name}` has no operations")));
     }
+    let has_part = setup.operations.iter().any(|op| matches!(op, CamOperation::Part { .. }));
     let machine = match str_(p, "machine") {
         Some(name) => Some(machine_named(cmd, name)?),
+        // A part's feeds are a machine's, so its program is written for one.
+        None if has_part => Some(machine_named(cmd, DEFAULT_MACHINE)?),
         None => None,
     };
     let post = match (&machine, str_(p, "post")) {
         (Some(m), None) => m.post().map_err(|e| bad(cmd, e.to_string()))?,
         (_, name) => resolve_post(&s.doc.cam, name.unwrap_or("rs274")).map_err(|e| bad(cmd, e))?,
     };
-    post.validate().map_err(|e| bad(cmd, e.to_string()))?;
     let program_name = str_(p, "program").unwrap_or(setup.name.as_str()).to_string();
     let mut program = Program { name: program_name, operations: Vec::new(), work_offset: Some(setup.work_offset) };
+    let mut planning: Vec<Issue> = Vec::new();
     for op in &setup.operations {
         let tool = s.doc.cam.tool(op.tool()).cloned().ok_or_else(|| bad(cmd, format!("operation `{}` needs tool {}", op.name(), op.tool())))?;
-        let path = build_path(s, &setup, op).map_err(|e| bad(cmd, e))?;
-        let (spindle_rpm, coolant) = match op {
-            CamOperation::Contour { spindle_rpm, coolant, .. } | CamOperation::Pocket { spindle_rpm, coolant, .. } => {
+        let (spindle_rpm, coolant) = match (op, &machine) {
+            (CamOperation::Contour { spindle_rpm, coolant, .. } | CamOperation::Pocket { spindle_rpm, coolant, .. }, _) => {
                 (spindle_rpm.or(tool.spindle_rpm).unwrap_or(6000.0), *coolant)
             }
+            (CamOperation::Part { .. }, Some(m)) => {
+                let plan = plan_op(s, &setup, op, &tool, m).map_err(|e| bad(cmd, format!("operation `{}`: {e}", op.name())))?;
+                program.operations.extend(plan.operations);
+                planning.extend(plan.issues);
+                continue;
+            }
+            (CamOperation::Part { .. }, None) => return Err(bad(cmd, format!("operation `{}` needs a machine", op.name()))),
         };
+        let path = build_path(s, &setup, op).map_err(|e| bad(cmd, e))?;
         program.operations.push(Operation { name: op.name().into(), tool, spindle_rpm, coolant, path });
     }
-    let gcode = emit(&program, &post).map_err(|e| bad(cmd, e.to_string()))?;
+    let path = path_param(cmd, p)?;
+    write_program(cmd, &program, &post, machine.as_ref(), planning, p.get("machine_origin"), path)
+}
+
+/// The file a command is to write, when it names one.
+fn path_param<'a>(cmd: &str, p: &'a Value) -> Result<Option<&'a str>> {
+    let path = match p.get("path") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(_) => str_(p, "path").filter(|v| !v.trim().is_empty() && v.len() < 4096).ok_or_else(|| bad(cmd, "`path` must be a file name"))?,
+    };
+    solidcraft_io::vfs::check(path).map_err(|e| crate::EngineError::Other(e.to_string()))?;
+    Ok(Some(path))
+}
+
+/// `program` as G-code of `post`, read back and checked (for `machine` too, with what
+/// `planning` it came with), and written to `path` once nothing stops it: the reply of `cam.post`.
+fn write_program(
+    cmd: &str,
+    program: &Program,
+    post: &Post,
+    machine: Option<&MachineProfile>,
+    planning: Vec<Issue>,
+    machine_origin: Option<&Value>,
+    path: Option<&str>,
+) -> Result<Value> {
+    post.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    let stopped = |i: &Issue| {
+        let at = i.at.as_deref().map(|a| format!("{a}: ")).unwrap_or_default();
+        format!("{at}{}", i.message)
+    };
+    if let Some(stop) = planning.iter().find(|i| i.severity == Severity::Error) {
+        return Err(bad(cmd, stopped(stop)));
+    }
+    if program.operations.is_empty() {
+        let why = planning.first().map(|i| format!(": {}", stopped(i))).unwrap_or_default();
+        return Err(bad(cmd, format!("there is nothing to cut{why}")));
+    }
+    let gcode = emit(program, post).map_err(|e| bad(cmd, e.to_string()))?;
     let mut out = json!({
         "gcode": gcode,
         "extension": post.extension,
         "post": post.name,
         "operations": program.operations.len(),
-        "work_offset": setup.work_offset,
+        "work_offset": program.work_offset.unwrap_or(1),
     });
-    let rb = readback(&gcode, &program, &post).map_err(|e| bad(cmd, e.to_string()))?;
+    let rb = readback(&gcode, program, post).map_err(|e| bad(cmd, e.to_string()))?;
     if !rb.within() {
         return Err(bad(cmd, format!("G-code read-back deviation {:.4} mm exceeds allowed {:.4} mm", rb.max_deviation, rb.allowed)));
     }
@@ -522,21 +666,188 @@ fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         "cut_minutes": rb.cut_minutes,
         "within": rb.within(),
     });
-    if let Some(m) = &machine {
-        let mut issues = check_program(&program, m).map_err(|e| bad(cmd, e.to_string()))?;
+    if let Some(m) = machine {
+        let mut issues = planning;
+        issues.extend(check_program(program, m).map_err(|e| bad(cmd, e.to_string()))?);
         issues.extend(check_text(&gcode, m).map_err(|e| bad(cmd, e.to_string()))?);
-        if let Some(origin) = p.get("machine_origin") {
+        if let Some(origin) = machine_origin {
             let o = vec3(origin).ok_or_else(|| bad(cmd, "`machine_origin` must be [x, y, z] in machine coordinates (mm)"))?;
-            issues.extend(check_travel(&program, m, [o.x, o.y, o.z]).map_err(|e| bad(cmd, e.to_string()))?);
+            issues.extend(check_travel(program, m, [o.x, o.y, o.z]).map_err(|e| bad(cmd, e.to_string()))?);
         }
         if let Some(stop) = issues.iter().find(|i| i.severity == Severity::Error) {
-            let at = stop.at.as_deref().map(|a| format!("{a}: ")).unwrap_or_default();
-            return Err(bad(cmd, format!("not written for {}: {at}{}", m.name, stop.message)));
+            return Err(bad(cmd, format!("not written for {}: {}", m.name, stopped(stop))));
         }
         out["machine"] = json!(m.name);
         out["issues"] = json!(issues);
     }
+    out["extents"] = extents(program);
+    if let Some(path) = path {
+        solidcraft_io::write_atomic(std::path::Path::new(path), gcode.as_bytes(), false).map_err(|e| crate::EngineError::Other(e.to_string()))?;
+        out["path"] = json!(path);
+    }
     Ok(out)
+}
+
+/// The box all of a program's motion stays in, in work coordinates (mm): where the work zero
+/// has to be for the cut to fit the plate and the table.
+fn extents(program: &Program) -> Value {
+    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for op in &program.operations {
+        for (pt, _) in op.path.points(0.05) {
+            for (k, v) in [pt.x, pt.y, pt.z].into_iter().enumerate() {
+                if let (Some(a), Some(b)) = (lo.get_mut(k), hi.get_mut(k)) {
+                    *a = a.min(v);
+                    *b = b.max(v);
+                }
+            }
+        }
+    }
+    if lo.iter().chain(&hi).all(|v| v.is_finite()) { json!({"min": lo, "max": hi}) } else { Value::Null }
+}
+
+/// The newest sketch of the design, for a command that was not told which.
+fn newest_sketch(s: &Session) -> Option<u64> {
+    s.doc.features.iter().rev().find(|f| matches!(f.kind, FeatureKind::Sketch { .. }) && !f.suppressed).map(|f| f.id)
+}
+
+fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.cut_out";
+    let setup_name = str_(p, "setup").map(str::trim).filter(|n| !n.is_empty() && n.len() <= 128).unwrap_or("Router").to_string();
+    let machine = machine_named(cmd, str_(p, "machine").unwrap_or(DEFAULT_MACHINE))?;
+    let dry_run = bool_(p, "dry_run").unwrap_or(false);
+    // What is cut: what the caller named, else the newest sketch.
+    let mut source = if p.is_object() { p.clone() } else { json!({}) };
+    if !["sketch", "faces", "outer", "regions"].iter().any(|k| p.get(*k).is_some()) {
+        let id = newest_sketch(s).ok_or_else(|| bad(cmd, "draw the part's outline in a sketch first (or name `sketch`, `faces` or `outer`)"))?;
+        source["sketch"] = json!(id);
+    }
+    let geometry = geometry_param(s, cmd, &source)?;
+    let name = match str_(p, "name").map(str::trim).filter(|n| !n.is_empty() && n.len() <= 128) {
+        Some(n) => n.to_string(),
+        None => match &geometry {
+            CamGeometry::Sketch { sketch, .. } => s.doc.feature(*sketch).map(|f| f.name.clone()).filter(|n| !n.is_empty() && n.len() <= 128),
+            _ => None,
+        }
+        .unwrap_or_else(|| "Part".to_string()),
+    };
+    // The tool: a defined one by number, or one of the size given, defined when the design has none.
+    let (tool, new_tool) = match (p.get("tool").filter(|v| !v.is_null()), length_param(s, cmd, p, "tool_diameter")?) {
+        (Some(_), _) => {
+            let n =
+                num(p, "tool").filter(|n| *n >= 1.0 && n.fract() == 0.0).map(|n| n as u32).ok_or_else(|| bad(cmd, "`tool` must be a tool number"))?;
+            (s.doc.cam.tool(n).cloned().ok_or_else(|| bad(cmd, format!("no tool {n} (give `tool_diameter` to define one)")))?, false)
+        }
+        (None, Some(d)) => {
+            let flutes = match p.get("flutes") {
+                None | Some(Value::Null) => 1,
+                Some(_) => num(p, "flutes")
+                    .filter(|n| *n >= 1.0 && *n <= 100.0 && n.fract() == 0.0)
+                    .map(|n| n as u32)
+                    .ok_or_else(|| bad(cmd, "`flutes` must be a whole number 1…100"))?,
+            };
+            let flute_length = length_param(s, cmd, p, "flute_length")?.unwrap_or(3.0 * d);
+            let same = |a: f64, b: f64| (a - b).abs() <= 1e-9;
+            let known = s
+                .doc
+                .cam
+                .tools
+                .iter()
+                .find(|t| t.kind == ToolKind::FlatEndmill && same(t.diameter, d) && same(t.flute_length, flute_length) && t.flutes == flutes);
+            match known {
+                Some(t) => (t.clone(), false),
+                None => {
+                    let number = (1..=9999u32).find(|n| s.doc.cam.tool(*n).is_none()).ok_or_else(|| bad(cmd, "no tool number is free"))?;
+                    if s.doc.cam.tools.len() >= MAX_TOOLS {
+                        return Err(bad(cmd, format!("a design has at most {MAX_TOOLS} tools")));
+                    }
+                    let mut tool = Tool::new(number, ToolKind::FlatEndmill, d, flute_length);
+                    tool.flutes = flutes;
+                    tool.description = format!("{d} mm flat end mill, {flutes} flute{}", if flutes == 1 { "" } else { "s" });
+                    tool.validate().map_err(|e| bad(cmd, e.to_string()))?;
+                    (tool, true)
+                }
+            }
+        }
+        (None, None) => return Err(bad(cmd, "give `tool` (a defined tool's number) or `tool_diameter`")),
+    };
+    let (setup, new_setup) = match s.doc.cam.setup(&setup_name) {
+        Some(setup) => (setup.clone(), false),
+        None => {
+            if s.doc.cam.setups.len() >= MAX_SETUPS {
+                return Err(bad(cmd, format!("a design has at most {MAX_SETUPS} setups")));
+            }
+            let setup = CamSetup::new(setup_name.clone());
+            setup.validate().map_err(|e| bad(cmd, e.to_string()))?;
+            (setup, true)
+        }
+    };
+    if setup.operations.len() >= MAX_OPS && !setup.operations.iter().any(|o| o.name() == name) {
+        return Err(bad(cmd, format!("a setup has at most {MAX_OPS} operations")));
+    }
+    let material: Material = word(cmd, p, "material", "aluminum, aluminum_soft, brass, acrylic, soft_plastic, hardwood or softwood")?
+        .ok_or_else(|| bad(cmd, "`material` is required: aluminum, aluminum_soft, brass, acrylic, soft_plastic, hardwood or softwood"))?;
+    let op = CamOperation::Part {
+        name: name.clone(),
+        tool: tool.number,
+        geometry,
+        material,
+        thickness: req_expr(cmd, p, "thickness")?,
+        tier: word(cmd, p, "tier", "careful, standard or bold")?.unwrap_or_default(),
+        top: expr(p, "top").unwrap_or_else(|| Expr::new("0 mm")),
+        finish_stock: expr(p, "finish_stock").unwrap_or_else(|| Expr::new("0.2 mm")),
+        break_through: expr(p, "break_through").unwrap_or_else(|| Expr::new("0.2 mm")),
+        coolant: bool_(p, "coolant").unwrap_or(true),
+        hold: word(cmd, p, "hold", "tabs or none")?.unwrap_or_default(),
+    };
+    op.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    // Everything is planned, written and checked before the design is touched.
+    let plan = plan_op(s, &setup, &op, &tool, &machine).map_err(|e| bad(cmd, e))?;
+    let cuts: Vec<Value> = plan.operations.iter().map(|o| json!({"name": o.name, "rpm": o.spindle_rpm, "feed": top_feed(&o.path)})).collect();
+    let program = Program { name: name.clone(), operations: plan.operations, work_offset: Some(setup.work_offset) };
+    let post = machine.post().map_err(|e| bad(cmd, e.to_string()))?;
+    let path = if dry_run { None } else { path_param(cmd, p)? };
+    let mut out = write_program(cmd, &program, &post, Some(&machine), plan.issues, None, path)?;
+    out["setup"] = json!(setup_name);
+    out["operation"] = json!(name);
+    out["tool"] = json!(tool);
+    out["cuts"] = json!(cuts);
+    if dry_run {
+        out["dry_run"] = json!(true);
+        return Ok(out);
+    }
+    let doc = s.doc_mut();
+    if new_tool {
+        doc.cam.tools.push(tool);
+        doc.cam.tools.sort_by_key(|t| t.number);
+    }
+    if new_setup {
+        doc.cam.setups.push(setup);
+    }
+    store_op(s, cmd, &setup_name, op)?;
+    Ok(out)
+}
+
+/// The fastest a path cuts (mm/min).
+fn top_feed(path: &solidcraft_cam::Toolpath) -> f64 {
+    path.moves
+        .iter()
+        .filter_map(|m| match m {
+            Move::Feed { feed, .. } | Move::Arc { feed, .. } | Move::PlaneArc { feed, .. } => Some(*feed),
+            Move::Rapid { .. } | Move::Dwell { .. } => None,
+        })
+        .fold(0.0, f64::max)
+}
+
+/// A length parameter: a number in mm, or an expression over the design's parameters and units.
+fn length_param(s: &Session, cmd: &str, p: &Value, k: &str) -> Result<Option<f64>> {
+    match p.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(_)) => num(p, k).map(Some).ok_or_else(|| bad(cmd, format!("`{k}` must be a length"))),
+        Some(_) => {
+            let e = req_expr(cmd, p, k)?;
+            eval_len(s, &e, k).map(Some).map_err(|e| bad(cmd, e))
+        }
+    }
 }
 
 fn machine_named(cmd: &str, name: &str) -> Result<MachineProfile> {
@@ -824,9 +1135,10 @@ fn engine_pocket(s: &Session, p: &CamPocketParams) -> std::result::Result<Pocket
 
 fn build_path(s: &Session, setup: &CamSetup, op: &CamOperation) -> std::result::Result<solidcraft_cam::Toolpath, String> {
     let regions = resolve_geometry(s, setup, op.geometry())?;
-    let cut = engine_cut(s, op.cut())?;
+    let cut = engine_cut(s, op.cut().ok_or("a part operation is planned for a machine, not cut as one path")?)?;
     let tool = s.doc.cam.tool(op.tool()).ok_or_else(|| format!("there is no tool {}", op.tool()))?;
     match op {
+        CamOperation::Part { .. } => Err("a part operation is planned for a machine, not cut as one path".into()),
         CamOperation::Contour { params, .. } => {
             let params = engine_contour(s, params)?;
             contour(&regions, tool, &params, &cut).map_err(|e| e.to_string())
@@ -867,6 +1179,10 @@ fn setup_json(setup: &CamSetup) -> Value {
             CamOperation::Pocket { name, tool, geometry, params, cut, spindle_rpm, coolant } => json!({
                 "type": "pocket", "name": name, "tool": tool, "geometry": geometry,
                 "params": params, "cut": cut, "spindle_rpm": spindle_rpm, "coolant": coolant,
+            }),
+            CamOperation::Part { name, tool, geometry, material, thickness, tier, top, finish_stock, break_through, coolant, hold } => json!({
+                "type": "part", "name": name, "tool": tool, "geometry": geometry, "material": material, "thickness": thickness,
+                "tier": tier, "top": top, "finish_stock": finish_stock, "break_through": break_through, "coolant": coolant, "hold": hold,
             }),
         }).collect::<Vec<_>>(),
     })
@@ -992,6 +1308,177 @@ mod tests {
         }
         assert!(s.execute("cam.post", &json!({"setup": "Top", "machine": "lathe"})).is_err());
         assert!(run(&mut s, "cam.list", json!({}))["builtin_machines"].as_array().is_some_and(|m| m.contains(&json!("flexihal-router"))));
+    }
+
+    #[test]
+    fn a_drawn_plate_is_cut_out_in_one_operation_that_follows_the_design() {
+        let mut s = Session::default();
+        run(&mut s, "parameters.add", json!({"name": "plate", "expression": "6 mm"}));
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+        run(&mut s, "sketch.circle.center", json!({"center": [30, 20], "radius": 10}));
+        let sketch = s.active_sketch.expect("sketch");
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "cam.tool.define", json!({"number": 1, "diameter": 6, "flute_length": 17, "flutes": 1}));
+        run(&mut s, "cam.setup", json!({"name": "Top"}));
+        let planned = run(
+            &mut s,
+            "cam.op.part",
+            json!({"setup": "Top", "name": "Plate", "tool": 1, "sketch": sketch, "material": "aluminum", "thickness": "plate"}),
+        );
+        // The drawn circle is the plate's opening, not a second part.
+        assert_eq!(planned["cuts"], json!(["Plate: Opening 1 rough", "Plate: Opening 1 finish", "Plate: Outside rough", "Plate: Outside finish"]));
+        // Tabs hold it, so the plan has nothing to warn of.
+        assert_eq!(planned["issues"], json!([]));
+        let listed = run(&mut s, "cam.list", json!({}));
+        assert_eq!((&listed["setups"][0]["operations"][0]["type"], &listed["setups"][0]["operations"][0]["hold"]), (&json!("part"), &json!("tabs")));
+
+        // Posting needs no machine named: a part is written for the router, with its checks.
+        let posted = run(&mut s, "cam.post", json!({"setup": "Top"}));
+        let gcode = posted["gcode"].as_str().unwrap();
+        assert_eq!(
+            (posted["machine"].as_str(), posted["post"].as_str(), posted["operations"].as_u64()),
+            (Some("flexihal-router"), Some("grblhal"), Some(4))
+        );
+        assert!(posted["readback"]["within"].as_bool().unwrap());
+        assert!(gcode.contains("Z-6.2") && gcode.contains("G53 G0 Z-5") && (gcode.contains("G2 ") || gcode.contains("G3 ")), "{gcode}");
+        assert!(posted["issues"].as_array().unwrap().iter().all(|i| i["severity"] == "warning"), "{}", posted["issues"]);
+        // The tabs are 1 mm of the plate left at the bottom of the outside.
+        assert!(gcode.contains("Z-5.2"), "{gcode}");
+
+        // Without tabs the same operation says the part comes loose.
+        let loose = run(
+            &mut s,
+            "cam.op.part",
+            json!({"setup": "Top", "name": "Plate", "tool": 1, "sketch": sketch, "material": "aluminum", "thickness": "plate", "hold": "none"}),
+        );
+        let issues = loose["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!((issues[0]["severity"].as_str(), issues[0]["at"].as_str()), (Some("warning"), Some("Plate: Outside")));
+        assert_eq!(s.doc.cam.setups[0].operations.len(), 1);
+
+        // A thicker plate is the same operation, cut deeper.
+        run(&mut s, "parameters.change", json!({"name": "plate", "expression": "10 mm"}));
+        let deeper = run(&mut s, "cam.post", json!({"setup": "Top"}));
+        let text = deeper["gcode"].as_str().unwrap();
+        assert!(text.contains("Z-10.2") && !text.contains("Z-6.2"), "{text}");
+
+        // A plate the flutes cannot get through is refused, with why and where.
+        run(&mut s, "parameters.change", json!({"name": "plate", "expression": "25 mm"}));
+        let refused = s.execute("cam.post", &json!({"setup": "Top"})).unwrap_err().to_string();
+        assert!(refused.contains("Plate") && refused.contains("longer cutter"), "{refused}");
+
+        for (params, why) in [
+            (json!({"setup": "Top", "name": "P", "tool": 1, "sketch": sketch, "thickness": 6}), "`material` is required"),
+            (json!({"setup": "Top", "name": "P", "tool": 1, "sketch": sketch, "material": "cheese", "thickness": 6}), "`material` must be one of"),
+            (json!({"setup": "Top", "name": "P", "tool": 1, "sketch": sketch, "material": "aluminum"}), "`thickness`"),
+            (json!({"setup": "Top", "name": "P", "tool": 1, "sketch": sketch, "material": "aluminum", "thickness": -6}), "thickness"),
+            (json!({"setup": "Top", "name": "P", "tool": 7, "sketch": sketch, "material": "aluminum", "thickness": 6}), "no tool 7"),
+            (json!({"setup": "Nope", "name": "P", "tool": 1, "sketch": sketch, "material": "aluminum", "thickness": 6}), "no setup `Nope`"),
+            (
+                json!({"setup": "Top", "name": "P", "tool": 1, "sketch": sketch, "material": "aluminum", "thickness": 6, "machine": "lathe"}),
+                "unknown machine",
+            ),
+            (
+                json!({"setup": "Top", "name": "P", "tool": 1, "sketch": sketch, "material": "aluminum", "thickness": 6, "hold": "glue"}),
+                "`hold` must be one of tabs or none",
+            ),
+        ] {
+            let e = s.execute("cam.op.part", &params).unwrap_err().to_string();
+            assert!(e.contains(why), "{params}: {e}");
+        }
+        assert_eq!(s.doc.cam.setups[0].operations.len(), 1);
+    }
+
+    #[test]
+    fn a_sketch_goes_to_a_checked_gcode_file_in_one_step() {
+        let mut s = Session::default();
+        let ask = json!({"material": "aluminum", "thickness": 6, "tool_diameter": 6});
+        let nothing = s.execute("cam.cut_out", &ask).unwrap_err().to_string();
+        assert!(nothing.contains("draw the part's outline in a sketch first"), "{nothing}");
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+        run(&mut s, "sketch.circle.center", json!({"center": [30, 20], "radius": 10}));
+        let sketch = s.active_sketch.expect("sketch");
+        run(&mut s, "sketch.finish", json!({}));
+        let sketch_name = s.doc.feature(sketch).unwrap().name.clone();
+
+        let dir = std::env::temp_dir().join(format!("solidcraft-cam-cut-out-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plate.nc");
+        let mut with_path = ask.clone();
+        with_path["path"] = json!(path.to_string_lossy());
+        let out = run(&mut s, "cam.cut_out", with_path);
+        assert_eq!(
+            (out["setup"].as_str(), out["operation"].as_str(), out["machine"].as_str()),
+            (Some("Router"), Some(sketch_name.as_str()), Some("flexihal-router"))
+        );
+        assert_eq!(out["cuts"].as_array().map(Vec::len), Some(4), "{}", out["cuts"]);
+        assert_eq!(
+            (out["cuts"][2]["name"].as_str(), out["cuts"][2]["rpm"].as_f64(), out["cuts"][2]["feed"].as_f64()),
+            (Some(format!("{sketch_name}: Outside rough").as_str()), Some(18500.0), Some(1110.0))
+        );
+        assert_eq!(
+            (out["tool"]["number"].as_u64(), out["tool"]["flutes"].as_u64(), out["tool"]["flute_length"].as_f64()),
+            (Some(1), Some(1), Some(18.0))
+        );
+        assert!(out["readback"]["within"].as_bool().unwrap());
+        // The roughing pass round the outside is the widest motion: 3.2 mm off the plate, 0.2 mm through it.
+        let (lo, hi) = (&out["extents"]["min"], &out["extents"]["max"]);
+        for (got, want) in [(&lo[0], -3.2), (&lo[1], -3.2), (&lo[2], -6.2), (&hi[0], 63.2), (&hi[1], 43.2), (&hi[2], 5.0)] {
+            assert!((got.as_f64().unwrap() - want).abs() < 0.01, "{got} is not {want}: {}", out["extents"]);
+        }
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(Some(written.as_str()), out["gcode"].as_str());
+        assert!(written.contains("G53 G0 Z-5") && written.trim_end().ends_with("M30"), "{written}");
+
+        // A dry run plans and checks the same program and keeps nothing.
+        let kept = s.doc.clone();
+        let mut dry = ask.clone();
+        dry["dry_run"] = json!(true);
+        dry["thickness"] = json!(10);
+        dry["tool_diameter"] = json!("8 mm");
+        dry["path"] = json!(dir.join("never.nc").to_string_lossy());
+        let tried = run(&mut s, "cam.cut_out", dry);
+        assert_eq!(
+            (tried["dry_run"].as_bool(), tried["tool"]["number"].as_u64(), tried["tool"]["diameter"].as_f64()),
+            (Some(true), Some(2), Some(8.0))
+        );
+        assert!(tried["path"].is_null() && !dir.join("never.nc").exists());
+        assert!(std::sync::Arc::ptr_eq(&s.doc, &kept), "a dry run leaves the design alone, with no undo step");
+
+        // Asked again, the same tool, setup and operation are used, not added to.
+        let mut thinner = ask.clone();
+        thinner["thickness"] = json!(3);
+        let again = run(&mut s, "cam.cut_out", thinner);
+        assert!(again["path"].is_null());
+        assert!((again["extents"]["min"][2].as_f64().unwrap() + 3.2).abs() < 0.01);
+        assert_eq!((s.doc.cam.tools.len(), s.doc.cam.setups.len(), s.doc.cam.setups[0].operations.len()), (1, 1, 1));
+        // Another cutter is another tool; a defined one is used by its number.
+        let small =
+            run(&mut s, "cam.cut_out", json!({"material": "acrylic", "thickness": 3, "tool_diameter": 3.175, "flute_length": 12, "name": "Small"}));
+        assert_eq!((small["tool"]["number"].as_u64(), small["operation"].as_str()), (Some(2), Some("Small")));
+        let by_number = run(&mut s, "cam.cut_out", json!({"material": "aluminum", "thickness": 6, "tool": 1, "sketch": sketch}));
+        assert_eq!(by_number["tool"]["number"].as_u64(), Some(1));
+        assert_eq!((s.doc.cam.tools.len(), s.doc.cam.setups[0].operations.len()), (2, 2));
+
+        // One step to undo, and a refusal leaves the design as it was.
+        let before = s.doc.cam.clone();
+        for (params, why) in [
+            (json!({"material": "aluminum", "thickness": 6}), "give `tool`"),
+            (json!({"material": "aluminum", "thickness": 6, "tool": 9}), "no tool 9"),
+            (json!({"material": "aluminum", "thickness": 6, "tool_diameter": 6, "flutes": 0}), "`flutes`"),
+            (json!({"material": "aluminum", "thickness": 6, "tool_diameter": -6}), "diameter"),
+            (json!({"material": "aluminum", "thickness": 60, "tool_diameter": 8, "setup": "Other"}), "longer cutter"),
+            (json!({"material": "aluminum", "thickness": 6, "tool_diameter": 6, "machine": "lathe"}), "unknown machine"),
+            (json!({"material": "aluminum", "thickness": 6, "tool_diameter": 6, "path": ""}), "`path`"),
+            (json!({"thickness": 6, "tool_diameter": 6}), "`material` is required"),
+        ] {
+            let e = s.execute("cam.cut_out", &params).unwrap_err();
+            assert!(matches!(&e, crate::EngineError::BadParams { cmd, msg } if cmd == "cam.cut_out" && msg.contains(why)), "{params}: {e}");
+            assert_eq!(s.doc.cam, before, "{params}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

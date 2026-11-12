@@ -1,7 +1,7 @@
 # Router CAM for Mark's Flexi-HAL router: design
 
 Date: 2026-11-12. Branch: `router-cam` in `vckrz8989m-ship-it/solidcraft`.
-Status: draft for review. Nothing below is built yet except where "Proven" says so.
+Status: draft for review; see "Built so far" for what exists on the branch.
 
 ## Goal
 
@@ -30,6 +30,23 @@ go from sketch to a posted file inside the app, pass the G-code checks and grblH
   produced a program with helix entry at 3 degrees, climb direction, rolled corners and
   finish passes. The external checker reported 0 errors.
 - Compiling the CAM crate with the geometry kernel took 14 minutes on a 2-core machine.
+
+## Built so far
+
+- Windows pipeline: build 1 of `router-windows.yml` succeeded (1 h 21 min, installer and
+  portable zip as one workflow artifact).
+- Router layer in `crates/cam/src/router/`: the `grblhal` post, the `flexihal-router` machine
+  profile, the feeds calculator, the program and text checks, and `auto`, which plans a part's
+  cuts: every opening the cutter fits is roughed and finished, nearest first, then the outside.
+- Commands: upstream's `cam.*` commands ported onto the current library, plus `cam.feeds`,
+  `cam.op.part` (a whole part as one saved operation, planned again at every post) and
+  `cam.cut_out` (sketch to checked G-code file in one step, with a dry run). `cam.post` takes a
+  machine and writes a file.
+- App: File > "Cut Out Part to G-code…" opens a dialog (sketch, material, thickness, cutter,
+  how hard to cut) with a Check button and Save G-code.
+
+Not built yet: holding tabs, drilling and helical bores as operations of their own, a toolpath
+preview in the viewport, a tool library with proven recipes, schemas for the CAM commands.
 
 ## Scope
 
@@ -72,8 +89,9 @@ Four layers, each testable without the ones above it.
 
 3. **Commands and design file (port of upstream pull request 2881).** `cam.tool.define`,
    `cam.setup`, `cam.op.contour`, `cam.op.pocket`, `cam.op.bore`, `cam.op.drill`,
-   `cam.op.remove`, `cam.post`, `cam.list`, plus `cam.auto` (run the auto rules on a
-   sketch or face) and `cam.machine` (choose or edit the profile). CAM settings are saved
+   `cam.op.remove`, `cam.post`, `cam.list`, plus `cam.op.part` and `cam.cut_out` (the auto
+   rules on a sketch or face; first called `cam.auto` here) and `cam.machine` (choose or edit
+   the profile). CAM settings are saved
    in the design through one pending format file, as the project requires. Every command
    has input and output schemas and never opens a dialog when called by a program.
 

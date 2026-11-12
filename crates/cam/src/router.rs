@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CamError, Move, Post, Program, Result, SafeRetract, invalid};
 
+pub mod auto;
 pub mod feeds;
 
 /// The largest value any length, feed or speed of a profile may have: far beyond any machine,
@@ -197,11 +198,11 @@ pub struct Issue {
 }
 
 impl Issue {
-    fn error(at: Option<String>, message: impl Into<String>) -> Issue {
+    pub(crate) fn error(at: Option<String>, message: impl Into<String>) -> Issue {
         Issue { severity: Severity::Error, at, message: message.into() }
     }
 
-    fn warning(at: Option<String>, message: impl Into<String>) -> Issue {
+    pub(crate) fn warning(at: Option<String>, message: impl Into<String>) -> Issue {
         Issue { severity: Severity::Warning, at, message: message.into() }
     }
 }

@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 use solidcore_record::{Loop2, Region2, Vec2, Vec3};
+use solidcraft_cam::router::auto::Hold;
+use solidcraft_cam::router::feeds::{Material, Tier};
 use solidcraft_cam::{Post, Tool};
 use solidcraft_geom::prelude::*;
 
@@ -720,6 +722,18 @@ fn plunge_mm() -> Expr {
     Expr::new("200 mm")
 }
 
+fn is_tabs(hold: &Hold) -> bool {
+    *hold == Hold::Tabs
+}
+
+fn finish_stock_mm() -> Expr {
+    Expr::new("0.2 mm")
+}
+
+fn break_through_mm() -> Expr {
+    Expr::new("0.2 mm")
+}
+
 fn check_expr(e: &Expr, label: &str) -> Result<()> {
     let s = e.as_str().trim();
     if s.is_empty() || s.len() > 4096 {
@@ -754,30 +768,59 @@ pub enum CamOperation {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         coolant: bool,
     },
+    /// A whole part cut out of plate: its openings, then its outside, each roughed and
+    /// finished at the machine's own feeds (`solidcraft_cam::router::auto`). The cuts are
+    /// planned when posting, so they follow the sketch, the thickness and the tool.
+    Part {
+        name: String,
+        tool: u32,
+        geometry: CamGeometry,
+        material: Material,
+        /// Thickness of the plate.
+        thickness: Expr,
+        #[serde(default)]
+        tier: Tier,
+        /// The plate's top in the setup's Z.
+        #[serde(default = "zero_mm")]
+        top: Expr,
+        /// Left on the walls by roughing for the finishing pass.
+        #[serde(default = "finish_stock_mm")]
+        finish_stock: Expr,
+        /// How far below the plate the cuts go.
+        #[serde(default = "break_through_mm")]
+        break_through: Expr,
+        #[serde(default = "true_val", skip_serializing_if = "Clone::clone")]
+        coolant: bool,
+        /// What keeps the part in place while its outside is cut through.
+        #[serde(default, skip_serializing_if = "is_tabs")]
+        hold: Hold,
+    },
 }
 
 impl CamOperation {
     pub fn name(&self) -> &str {
         match self {
-            CamOperation::Contour { name, .. } | CamOperation::Pocket { name, .. } => name,
+            CamOperation::Contour { name, .. } | CamOperation::Pocket { name, .. } | CamOperation::Part { name, .. } => name,
         }
     }
 
     pub fn tool(&self) -> u32 {
         match self {
-            CamOperation::Contour { tool, .. } | CamOperation::Pocket { tool, .. } => *tool,
+            CamOperation::Contour { tool, .. } | CamOperation::Pocket { tool, .. } | CamOperation::Part { tool, .. } => *tool,
         }
     }
 
     pub fn geometry(&self) -> &CamGeometry {
         match self {
-            CamOperation::Contour { geometry, .. } | CamOperation::Pocket { geometry, .. } => geometry,
+            CamOperation::Contour { geometry, .. } | CamOperation::Pocket { geometry, .. } | CamOperation::Part { geometry, .. } => geometry,
         }
     }
 
-    pub fn cut(&self) -> &CamCut {
+    /// The heights and feeds it was given; a part has none, they are planned when posting.
+    pub fn cut(&self) -> Option<&CamCut> {
         match self {
-            CamOperation::Contour { cut, .. } | CamOperation::Pocket { cut, .. } => cut,
+            CamOperation::Contour { cut, .. } | CamOperation::Pocket { cut, .. } => Some(cut),
+            CamOperation::Part { .. } => None,
         }
     }
 
@@ -787,14 +830,15 @@ impl CamOperation {
             return Err(DocError::Invalid("a CAM operation name must be 1 to 128 characters".into()));
         }
         self.geometry().validate()?;
-        let cut = self.cut();
-        check_expr(&cut.clearance, "clearance")?;
-        check_expr(&cut.retract, "retract")?;
-        check_expr(&cut.top, "top")?;
-        check_expr(&cut.bottom, "bottom")?;
-        check_expr(&cut.stepdown, "stepdown")?;
-        check_expr(&cut.feed, "feed")?;
-        check_expr(&cut.plunge_feed, "plunge_feed")?;
+        if let Some(cut) = self.cut() {
+            check_expr(&cut.clearance, "clearance")?;
+            check_expr(&cut.retract, "retract")?;
+            check_expr(&cut.top, "top")?;
+            check_expr(&cut.bottom, "bottom")?;
+            check_expr(&cut.stepdown, "stepdown")?;
+            check_expr(&cut.feed, "feed")?;
+            check_expr(&cut.plunge_feed, "plunge_feed")?;
+        }
         match self {
             CamOperation::Contour { params, spindle_rpm, .. } => {
                 check_expr(&params.stock_to_leave, "stock_to_leave")?;
@@ -808,6 +852,12 @@ impl CamOperation {
                 check_expr(&params.tolerance, "tolerance")?;
                 check_expr(&params.ramp_angle, "ramp_angle")?;
                 check_spindle(*spindle_rpm)?;
+            }
+            CamOperation::Part { thickness, top, finish_stock, break_through, .. } => {
+                check_expr(thickness, "thickness")?;
+                check_expr(top, "top")?;
+                check_expr(finish_stock, "finish_stock")?;
+                check_expr(break_through, "break_through")?;
             }
         }
         Ok(())
@@ -847,6 +897,37 @@ mod tests {
         let p = PolygonRegion { outer: vec![[0.0, 0.0], [40.0, 0.0], [40.0, 30.0], [0.0, 30.0]], holes: vec![] };
         let r = p.to_region().unwrap();
         assert!((r.outer.signed_area() - 1200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_part_operation_reads_with_its_defaults_and_writes_what_it_was_given() {
+        let text = r#"{"type":"part","name":"Plate","tool":1,"geometry":{"type":"sketch","sketch":3},"material":"aluminum","thickness":"6 mm"}"#;
+        let op: CamOperation = serde_json::from_str(text).unwrap();
+        let CamOperation::Part { tier, top, finish_stock, break_through, coolant, hold, .. } = &op else { panic!("not a part: {op:?}") };
+        assert_eq!(
+            (*tier, top.as_str(), finish_stock.as_str(), break_through.as_str(), *coolant),
+            (Tier::Standard, "0 mm", "0.2 mm", "0.2 mm", true)
+        );
+        assert_eq!(*hold, Hold::Tabs);
+        assert!(!serde_json::to_string(&op).unwrap().contains("hold"));
+        assert!(op.cut().is_none());
+        op.validate().unwrap();
+        let back: CamOperation = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        assert_eq!(back, op);
+        let blank = CamOperation::Part {
+            name: "Plate".into(),
+            tool: 1,
+            geometry: CamGeometry::Sketch { sketch: 3, profiles: profile_all() },
+            material: Material::Aluminum,
+            thickness: Expr::new(" "),
+            tier: Tier::Bold,
+            top: zero_mm(),
+            finish_stock: finish_stock_mm(),
+            break_through: break_through_mm(),
+            coolant: false,
+            hold: Hold::None,
+        };
+        assert!(blank.validate().is_err());
     }
 
     #[test]

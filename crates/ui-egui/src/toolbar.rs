@@ -486,6 +486,7 @@ fn file_rows(app: &SolveApp) -> Vec<app_bar::FileRow> {
     rows.push(row("file.export_obj", app.tr_label("Export OBJ…"), &key("file.export_obj"), "export", shown));
     rows.push(row("file.export_urdf", app.tr_label("Export URDF…"), &key("file.export_urdf"), "export", shown));
     rows.push(row("export_json", app.tr_label("Export Design as JSON…"), "", "export", true));
+    rows.push(row("cam.cut_out", app.tr_label("Cut Out Part to G-code…"), "", "cut", shown));
     rows.push(FileRow::Separator);
     rows.push(row("document.metadata", &format!("{}…", app.tr_label("Design Properties")), "", "settings", shown));
     rows.push(FileRow::Separator);
@@ -518,6 +519,7 @@ fn run_file_row(app: &mut SolveApp, id: &str) {
         "file.export_3mf" => FileAction::Command("file.export_3mf").run(app),
         "file.export_step" => FileAction::Command("file.export_step").run(app),
         "file.export_view_dxf" => FileAction::Command("file.export_view_dxf").run(app),
+        "cam.cut_out" => FileAction::Command("cam.cut_out").run(app),
         "file.export_obj" => FileAction::Command("file.export_obj").run(app),
         "file.export_urdf" => FileAction::Command("file.export_urdf").run(app),
         "document.metadata" => FileAction::Command("document.metadata").run(app),
