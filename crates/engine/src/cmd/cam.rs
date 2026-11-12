@@ -4,6 +4,9 @@
 //! expressions evaluated when posting.
 
 use serde_json::{Value, json};
+use solidcore_record::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
+use solidcraft_cam::router::feeds::{CutKind, FeedRequest, Material, Tier, recipe};
+use solidcraft_cam::router::{MachineProfile, Severity, check_program, check_text, check_travel};
 use solidcraft_cam::{
     ContourParams, Cut, Feeds, Heights, Operation, PocketParams, Post, Program, Side, Tool, ToolKind, contour, emit, pocket, readback,
 };
@@ -14,7 +17,7 @@ use solidcraft_doc::cam::{
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::project::resolve_face_indices;
 use solidcraft_doc::{Expr, FeatureKind, select_profiles};
-use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
+use solidcraft_geom::prelude::*;
 use solidcraft_sketch::{LinkGeom, LinkKind};
 
 use super::CommandSpec;
@@ -48,8 +51,20 @@ pub static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new("cam.op.remove", "Remove CAM Operation", delete_op).icon("delete").params("setup; name"),
     CommandSpec::new("cam.post", "Post Process", post_cmd).icon("export").noundo().params(
-        "setup; post?: rs274 | name of a saved post (default rs274); program?: name (default the setup's) → \
-         {gcode, extension, post, operations, readback}. G-code is always read back and checked against the toolpaths.",
+        "setup; post?: grblhal | rs274 | name of a saved post (default rs274, or the machine's own); \
+         machine?: flexihal-router (its post, and its checks: spindle range, feeds and arcs it can follow, codes and \
+         machine-coordinate moves its controller refuses); machine_origin?: [x,y,z] the work zero in machine coordinates \
+         (checks travel when the machine's is known); program?: name (default the setup's) → \
+         {gcode, extension, post, operations, readback, machine?, issues?}. G-code is always read back and checked \
+         against the toolpaths; with a machine, an issue that would stop the program is an error.",
+    ),
+    CommandSpec::new("cam.feeds", "Feeds and Speeds", feeds_cmd).icon("settings").params(
+        "material: aluminum|aluminum_soft|brass|acrylic|soft_plastic|hardwood|softwood; \
+         kind: slot|pocket|adaptive|finish|bore; tool?: number of a defined tool, or diameter (mm) with flutes? (default 1); \
+         tier?: careful|standard|bold (default standard); rpm?; width?; depth? (mm; for a bore the helix pitch); \
+         machine?: (default flexihal-router); apply?: bool (write the speed, feeds, depth and width into the tool) → \
+         {recipe: {rpm, feed, ramp_feed, width, depth, chip_thickness, cut_power, spindle_power, warnings, …}}. \
+         A starting point for a test cut, not a proven recipe.",
     ),
     CommandSpec::new("cam.list", "List CAM", list_cmd).icon("list").noundo().params("→ tools, setups (with operations) and saved posts"),
 ];
@@ -168,7 +183,7 @@ fn setup_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     setup.flip_z = bool_(p, "flip_z").unwrap_or(existing.as_ref().map(|e| e.flip_z).unwrap_or(false));
     setup.flip_x = bool_(p, "flip_x").unwrap_or(existing.as_ref().map(|e| e.flip_x).unwrap_or(false));
     setup.model_bodies = if p.get("model_bodies").is_some() {
-        string_list(p, "model_bodies")
+        string_list(cmd, p, "model_bodies")?
     } else {
         existing.as_ref().map(|e| e.model_bodies.clone()).unwrap_or_default()
     };
@@ -467,8 +482,14 @@ fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     if setup.operations.is_empty() {
         return Err(bad(cmd, format!("setup `{setup_name}` has no operations")));
     }
-    let post_name = str_(p, "post").unwrap_or("rs274");
-    let post = resolve_post(&s.doc.cam, post_name).map_err(|e| bad(cmd, e))?;
+    let machine = match str_(p, "machine") {
+        Some(name) => Some(machine_named(cmd, name)?),
+        None => None,
+    };
+    let post = match (&machine, str_(p, "post")) {
+        (Some(m), None) => m.post().map_err(|e| bad(cmd, e.to_string()))?,
+        (_, name) => resolve_post(&s.doc.cam, name.unwrap_or("rs274")).map_err(|e| bad(cmd, e))?,
+    };
     post.validate().map_err(|e| bad(cmd, e.to_string()))?;
     let program_name = str_(p, "program").unwrap_or(setup.name.as_str()).to_string();
     let mut program = Program { name: program_name, operations: Vec::new(), work_offset: Some(setup.work_offset) };
@@ -501,6 +522,86 @@ fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         "cut_minutes": rb.cut_minutes,
         "within": rb.within(),
     });
+    if let Some(m) = &machine {
+        let mut issues = check_program(&program, m).map_err(|e| bad(cmd, e.to_string()))?;
+        issues.extend(check_text(&gcode, m).map_err(|e| bad(cmd, e.to_string()))?);
+        if let Some(origin) = p.get("machine_origin") {
+            let o = vec3(origin).ok_or_else(|| bad(cmd, "`machine_origin` must be [x, y, z] in machine coordinates (mm)"))?;
+            issues.extend(check_travel(&program, m, [o.x, o.y, o.z]).map_err(|e| bad(cmd, e.to_string()))?);
+        }
+        if let Some(stop) = issues.iter().find(|i| i.severity == Severity::Error) {
+            let at = stop.at.as_deref().map(|a| format!("{a}: ")).unwrap_or_default();
+            return Err(bad(cmd, format!("not written for {}: {at}{}", m.name, stop.message)));
+        }
+        out["machine"] = json!(m.name);
+        out["issues"] = json!(issues);
+    }
+    Ok(out)
+}
+
+fn machine_named(cmd: &str, name: &str) -> Result<MachineProfile> {
+    MachineProfile::builtin(name).ok_or_else(|| bad(cmd, format!("unknown machine `{name}` (built-in: {})", MachineProfile::BUILTIN.join(", "))))
+}
+
+/// A word of a closed list, read the way the design file writes it (`snake_case`).
+fn word<T: serde::de::DeserializeOwned>(cmd: &str, p: &Value, k: &str, choices: &str) -> Result<Option<T>> {
+    match p.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => serde_json::from_value(v.clone()).map(Some).map_err(|_| bad(cmd, format!("`{k}` must be one of {choices}"))),
+    }
+}
+
+fn feeds_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.feeds";
+    let machine = machine_named(cmd, str_(p, "machine").unwrap_or("flexihal-router"))?;
+    let materials = "aluminum, aluminum_soft, brass, acrylic, soft_plastic, hardwood, softwood";
+    let material: Material = word(cmd, p, "material", materials)?.ok_or_else(|| bad(cmd, format!("`material` is required ({materials})")))?;
+    let kinds = "slot, pocket, adaptive, finish, bore";
+    let kind: CutKind = word(cmd, p, "kind", kinds)?.ok_or_else(|| bad(cmd, format!("`kind` is required ({kinds})")))?;
+    let tier: Tier = word(cmd, p, "tier", "careful, standard, bold")?.unwrap_or_default();
+    let apply = bool_(p, "apply").unwrap_or(false);
+    let number = match p.get("tool") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(
+            num(p, "tool")
+                .filter(|n| *n >= 1.0 && *n <= 9999.0 && n.fract() == 0.0)
+                .map(|n| n as u32)
+                .ok_or_else(|| bad(cmd, "`tool` must be a tool number 1…9999"))?,
+        ),
+    };
+    let mut request = match number {
+        Some(n) => {
+            let tool = s.doc.cam.tool(n).ok_or_else(|| bad(cmd, format!("no tool {n}")))?;
+            let mut r = FeedRequest::new(material, tool.diameter, tool.flutes, kind);
+            r.flute_length = Some(tool.flute_length);
+            r
+        }
+        None => {
+            let diameter = num(p, "diameter").ok_or_else(|| bad(cmd, "give `tool` (a defined tool's number) or `diameter` (mm)"))?;
+            let flutes = match p.get("flutes") {
+                None | Some(Value::Null) => 1,
+                Some(_) => num(p, "flutes")
+                    .filter(|n| *n >= 1.0 && *n <= 12.0 && n.fract() == 0.0)
+                    .map(|n| n as u32)
+                    .ok_or_else(|| bad(cmd, "`flutes` must be 1…12"))?,
+            };
+            FeedRequest::new(material, diameter, flutes, kind)
+        }
+    };
+    request.tier = tier;
+    request.rpm = num(p, "rpm");
+    request.width = num(p, "width");
+    request.depth = num(p, "depth");
+    let found = recipe(&request, &machine).map_err(|e| bad(cmd, e.to_string()))?;
+    let mut out = json!({"recipe": found, "machine": machine.name});
+    if apply {
+        let n = number.ok_or_else(|| bad(cmd, "`apply` needs `tool`: the recipe is written into a defined tool"))?;
+        let doc = s.doc_mut();
+        let tool = doc.cam.tools.iter_mut().find(|t| t.number == n).ok_or_else(|| bad(cmd, format!("no tool {n}")))?;
+        found.apply(tool);
+        tool.validate().map_err(|e| bad(cmd, e.to_string()))?;
+        out["tool"] = json!(tool);
+    }
     Ok(out)
 }
 
@@ -743,6 +844,7 @@ fn list_cmd(s: &mut Session, _p: &Value) -> Result<Value> {
         "setups": s.doc.cam.setups.iter().map(setup_json).collect::<Vec<_>>(),
         "posts": s.doc.cam.posts.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
         "builtin_posts": Post::BUILTIN,
+        "builtin_machines": MachineProfile::BUILTIN,
     }))
 }
 
@@ -826,6 +928,70 @@ mod tests {
 
         let forced = run(&mut Session::new(s.doc.as_ref().clone()), "cam.post", json!({"setup": "Top", "verify": false}));
         assert!(forced["readback"]["within"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn a_machine_supplies_feeds_its_post_and_its_checks() {
+        let mut s = Session::default();
+        run(&mut s, "cam.tool.define", json!({"number": 1, "diameter": 6, "flute_length": 17, "flutes": 1}));
+        // A recipe without touching the design, then one written into the tool.
+        let asked = run(&mut s, "cam.feeds", json!({"material": "aluminum", "kind": "adaptive", "diameter": 6}));
+        assert_eq!((asked["recipe"]["rpm"].as_f64(), asked["recipe"]["feed"].as_f64()), (Some(18500.0), Some(1730.0)));
+        assert_eq!(asked["machine"], "flexihal-router");
+        assert_eq!(s.doc.cam.tools[0].feed, None);
+        let slot = run(&mut s, "cam.feeds", json!({"material": "aluminum", "kind": "slot", "tool": 1, "apply": true}));
+        assert_eq!(slot["tool"]["feed"].as_f64(), Some(1110.0));
+        let tool = &s.doc.cam.tools[0];
+        assert_eq!((tool.spindle_rpm, tool.feed, tool.plunge_feed, tool.stepdown), (Some(18500.0), Some(1110.0), Some(560.0), Some(1.5)));
+
+        run(&mut s, "cam.setup", json!({"name": "Top"}));
+        run(
+            &mut s,
+            "cam.op.contour",
+            json!({
+                "setup": "Top", "name": "Outside", "tool": 1, "outer": [[0,0],[60,0],[60,40],[0,40]],
+                "side": "outside", "bottom": -6.2, "ramp_angle": 3,
+            }),
+        );
+        let posted = run(&mut s, "cam.post", json!({"setup": "Top", "machine": "flexihal-router", "machine_origin": [-700, -450, -60]}));
+        let gcode = posted["gcode"].as_str().unwrap();
+        let lines: Vec<&str> = gcode.lines().collect();
+        assert_eq!(&lines[1..4], ["G90 G94 G17 G21", "G54", "G53 G0 Z-5"], "{gcode}");
+        let on = lines.iter().position(|l| *l == "S18500 M3").unwrap();
+        assert_eq!(lines[on + 1], "G4 P8");
+        assert_eq!(&lines[lines.len() - 2..], ["G53 G0 Z-5", "M30"]);
+        assert!(!gcode.contains("G43") && !gcode.contains("G49"));
+        assert_eq!(
+            (posted["post"].as_str(), posted["extension"].as_str(), posted["machine"].as_str()),
+            (Some("grblhal"), Some("nc"), Some("flexihal-router"))
+        );
+        assert!(posted["readback"]["within"].as_bool().unwrap());
+        assert_eq!(posted["issues"], json!([]));
+        // The machine with another post still gets the machine's checks.
+        let other = run(&mut s, "cam.post", json!({"setup": "Top", "machine": "flexihal-router", "post": "grblhal"}));
+        assert!(!other["gcode"].as_str().unwrap().contains("G53"));
+
+        // What would stop the program is an error, with the operation it is in.
+        run(&mut s, "cam.tool.define", json!({"number": 2, "diameter": 6, "flute_length": 17, "spindle_rpm": 8000, "feed": 600}));
+        run(&mut s, "cam.op.contour", json!({"setup": "Top", "name": "Slow", "tool": 2, "outer": [[0,0],[60,0],[60,40],[0,40]], "bottom": -1}));
+        let refused = s.execute("cam.post", &json!({"setup": "Top", "machine": "flexihal-router"})).unwrap_err().to_string();
+        assert!(refused.contains("Slow") && refused.contains("8000 rpm is outside the spindle"), "{refused}");
+        // Without a machine the same program is written as before.
+        assert!(run(&mut s, "cam.post", json!({"setup": "Top"}))["issues"].is_null());
+
+        for (params, why) in [
+            (json!({"material": "aluminum", "kind": "slot", "diameter": 6, "apply": true}), "`apply` needs `tool`"),
+            (json!({"material": "unobtainium", "kind": "slot", "diameter": 6}), "`material` must be one of"),
+            (json!({"material": "aluminum", "kind": "slot"}), "give `tool`"),
+            (json!({"material": "aluminum", "kind": "slot", "tool": 9}), "no tool 9"),
+            (json!({"material": "aluminum", "kind": "slot", "diameter": 6, "machine": "lathe"}), "unknown machine `lathe`"),
+            (json!({"material": "aluminum", "kind": "slot", "diameter": -6}), "diameter"),
+        ] {
+            let e = s.execute("cam.feeds", &params).unwrap_err().to_string();
+            assert!(e.contains(why), "{params}: {e}");
+        }
+        assert!(s.execute("cam.post", &json!({"setup": "Top", "machine": "lathe"})).is_err());
+        assert!(run(&mut s, "cam.list", json!({}))["builtin_machines"].as_array().is_some_and(|m| m.contains(&json!("flexihal-router"))));
     }
 
     #[test]

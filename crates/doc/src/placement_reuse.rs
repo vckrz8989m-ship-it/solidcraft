@@ -162,6 +162,8 @@ fn same_geometry_inputs(a: &Document, b: &Document) -> bool {
         visibility,
         point_clouds,
         notes: _,
+        // CAM settings (tools, setups, operations) read geometry and place nothing.
+        cam: _,
     } = a;
     (Arc::ptr_eq(render, &b.render) || *render == b.render)
         && *format == b.format
