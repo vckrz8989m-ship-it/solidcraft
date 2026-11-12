@@ -140,7 +140,7 @@ fn tabs_for(outline: &Loop2, tool: &Tool, material: Material, total: f64) -> Tab
     Tabs {
         layout: TabLayout::Count(count),
         width: tool.diameter.max(5.0),
-        height: (if metal { 1.0 } else { 2.0 }).min(0.5 * total),
+        height: f64::min(if metal { 1.0 } else { 2.0 }, 0.5 * total),
         ramp_angle: 30.0f64.to_radians(),
     }
 }

@@ -413,7 +413,7 @@ fn a_part_is_planned_openings_first_and_its_outside_last() {
 
     // The whole plan posts for the machine with nothing the machine refuses.
     let program = Program { name: "plate".into(), operations: plan.operations, ..Program::default() };
-    let text = emit(&program, &m.post()).unwrap();
+    let text = emit(&program, &m.post().unwrap()).unwrap();
     assert!(check_text(&text, &m).unwrap().iter().all(|i| i.severity != Severity::Error));
     assert!(check_program(&program, &m).unwrap().iter().all(|i| i.severity != Severity::Error));
 }
