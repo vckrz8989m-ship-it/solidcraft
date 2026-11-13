@@ -5,6 +5,7 @@ use solidcraft_geom::prelude::*;
 
 use crate::router::auto::{Hold, PartCut, Pocket, plan_part, plan_part_with};
 use crate::router::feeds::{CutKind, FeedRequest, Material, Recipe, Tier, chip_thinning, recipe};
+use crate::router::solid::{SolidCut, plan_solid};
 use crate::router::{MachineProfile, Severity, check_program, check_text, check_travel};
 use crate::*;
 
@@ -568,4 +569,156 @@ fn pockets_are_cut_to_their_depth_before_the_openings_and_round_their_islands() 
             "depth {bad}"
         );
     }
+}
+
+/// A 60 × 40 mm base from Z −16 to Z −7 with a round boss on it at (30, 20): 10 mm radius,
+/// its wall up to Z −4.51, its top a dome of 16 mm radius reaching Z −1. A closed body.
+fn bossed_base() -> Surface {
+    let mut tris = crate::foundation_tests::block(Vec3::new(0.0, 0.0, -16.0), Vec3::new(60.0, 40.0, -7.0)).triangles().to_vec();
+    // The dome is about (30, 20, −17): at 10 mm from the axis it is √(16² − 10²) = 12.49 above.
+    let widest = (10.0f64 / 16.0).asin();
+    let dome = (0..=24).map(|k| widest * (1.0 - k as f64 / 24.0)).map(|a| (16.0 * a.sin(), -17.0 + 16.0 * a.cos()));
+    let profile: Vec<(f64, f64)> = std::iter::once((10.0, -7.0)).chain(dome).collect();
+    let n = 96;
+    let at = |r: f64, z: f64, k: usize| {
+        let th = 2.0 * PI * k as f64 / n as f64;
+        Vec3::new(30.0 + r * th.cos(), 20.0 + r * th.sin(), z)
+    };
+    for w in profile.windows(2) {
+        for k in 0..n {
+            tris.push([at(w[0].0, w[0].1, k), at(w[1].0, w[1].1, k), at(w[1].0, w[1].1, k + 1)]);
+            tris.push([at(w[0].0, w[0].1, k), at(w[1].0, w[1].1, k + 1), at(w[0].0, w[0].1, k + 1)]);
+        }
+    }
+    Surface::new(tris).unwrap()
+}
+
+fn ball(diameter: f64) -> Tool {
+    Tool::new(2, ToolKind::BallEndmill, diameter, 20.0)
+}
+
+/// How close the cutting points of `op` come to where its cutter touches `surface` from above
+/// (mm; negative when the cutter goes into the part), and the lowest Z it cuts at.
+fn closest_to(op: &Operation, surface: &Surface) -> (f64, f64) {
+    let cutter = op.tool.cutter().unwrap();
+    let (mut gap, mut low) = (f64::INFINITY, f64::INFINITY);
+    for (p, cutting) in op.path.points(0.01) {
+        if cutting {
+            low = low.min(p.z);
+            if let Some(z) = drop_z(surface, &cutter, p.x, p.y) {
+                gap = gap.min(p.z - z);
+            }
+        }
+    }
+    (gap, low)
+}
+
+#[test]
+fn a_solid_is_roughed_walled_and_finished_without_cutting_into_it() {
+    let (m, part) = (machine(), bossed_base());
+    let mut rough = one_flute(6.0);
+    rough.flute_length = 22.0;
+    let cut = SolidCut::new(Material::Aluminum);
+    let plan = plan_solid(&part, &rough, Some(&ball(6.0)), &cut, &m).unwrap();
+    let names: Vec<&str> = plan.operations.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(names, ["Rough", "Walls", "Finish"]);
+    assert_eq!(plan.operations.iter().map(|o| o.tool.number).collect::<Vec<_>>(), [1, 1, 2]);
+    // The part stays on its skin, and the plan says so.
+    assert_eq!(plan.issues.len(), 1, "{:?}", plan.issues);
+    assert!(plan.issues[0].severity == Severity::Warning && plan.issues[0].message.contains("0.50 mm skin"), "{:?}", plan.issues);
+
+    // Speeds and feeds are the recipes' for each cutter.
+    let slot = recipe(&ask(6.0, 1, CutKind::Slot), &m).unwrap();
+    let wall = recipe(&ask(6.0, 1, CutKind::Finish), &m).unwrap();
+    let fine = recipe(&ask(6.0, 2, CutKind::Finish), &m).unwrap();
+    for (op, r) in plan.operations.iter().zip([&slot, &wall, &fine]) {
+        close(op.spindle_rpm, r.rpm, 1e-9);
+        let fastest = op.path.moves.iter().filter_map(|mv| if let Move::Feed { feed, .. } = mv { Some(*feed) } else { None }).fold(0.0, f64::max);
+        close(fastest, r.feed, 1e-9);
+    }
+
+    // Roughing stays the finishing stock above the part; the walls and the finishing passes come
+    // to it and never into it. Nothing cuts below the skin: the part is 15 mm high from Z −16,
+    // so the floor is Z −15.5, and roughing and the walls reach it.
+    let (gap, low): (Vec<f64>, Vec<f64>) = plan.operations.iter().map(|op| closest_to(op, &part)).unzip();
+    assert!(gap[0] >= 0.3 - 0.02, "roughing comes within {} mm", gap[0]);
+    assert!(gap[1] >= -0.02 && gap[1] < 0.05, "the walls come within {} mm", gap[1]);
+    assert!(gap[2] >= -0.02 && gap[2] < 0.02, "finishing comes within {} mm", gap[2]);
+    close(low[0], -15.5, 1e-6);
+    close(low[1], -15.5, 1e-6);
+    assert!(low[2] >= -15.5 - 1e-6);
+    // The finishing passes are a tenth of the ball's diameter apart and go over the dome's top.
+    let over: Vec<Vec3> = plan.operations[2].path.points(0.01).into_iter().filter(|(_, cutting)| *cutting).map(|(p, _)| p).collect();
+    let mut rows: Vec<f64> = over.iter().map(|p| (p.y / 0.6).round()).collect();
+    rows.sort_by(f64::total_cmp);
+    rows.dedup();
+    assert!(rows.len() >= 67 && rows.windows(2).all(|w| w[1] - w[0] <= 1.0), "{} rows", rows.len());
+    assert!(over.iter().any(|p| (p.x - 30.0).hypot(p.y - 20.0) < 0.7 && (p.z + 1.0).abs() < 0.05));
+
+    // Every operation leaves from and returns to above the block, and the plan posts with
+    // nothing the machine refuses.
+    let heights = Heights { clearance: 4.5, retract: 1.0, top: -0.5, bottom: -15.5 };
+    for op in &plan.operations {
+        verify(&op.path, &heights).unwrap();
+    }
+    let program = Program { name: "boss".into(), operations: plan.operations, ..Program::default() };
+    let text = emit(&program, &m.post().unwrap()).unwrap();
+    assert!(check_text(&text, &m).unwrap().iter().all(|i| i.severity != Severity::Error));
+    let refused: Vec<_> = check_program(&program, &m).unwrap().into_iter().filter(|i| i.severity == Severity::Error).collect();
+    assert_eq!(refused, []);
+}
+
+#[test]
+fn one_cutter_can_do_a_whole_solid_and_what_cannot_be_cut_is_said() {
+    let (m, part) = (machine(), bossed_base());
+    let mut rough = one_flute(6.0);
+    rough.flute_length = 22.0;
+    let cut = SolidCut::new(Material::Aluminum);
+    // One flat cutter: the same three operations, and a note that a flat end mill leaves steps.
+    let plan = plan_solid(&part, &rough, None, &cut, &m).unwrap();
+    assert_eq!(plan.operations.iter().map(|o| (o.name.as_str(), o.tool.number)).collect::<Vec<_>>(), [("Rough", 1), ("Walls", 1), ("Finish", 1)]);
+    assert!(plan.issues.iter().any(|i| i.message.contains("a ball end mill follows them")), "{:?}", plan.issues);
+    assert!(closest_to(&plan.operations[2], &part).0 >= -0.02);
+    // With no skin the part is cut free, and the plan warns of it.
+    let free = plan_solid(&part, &rough, None, &SolidCut { skin: 0.0, ..cut }, &m).unwrap();
+    assert!(free.issues.iter().any(|i| i.message.contains("nothing holds it")), "{:?}", free.issues);
+    close(closest_to(&free.operations[0], &part).1, -16.0, 1e-6);
+
+    // A cutter too short for the cut, or a skin as thick as the part, is an error and no cut.
+    let stub = Tool { flute_length: 12.0, ..one_flute(6.0) };
+    let short = plan_solid(&part, &stub, None, &cut, &m).unwrap();
+    assert!(
+        short.operations.is_empty() && short.issues[0].severity == Severity::Error && short.issues[0].message.contains("12.00 mm of flute"),
+        "{:?}",
+        short.issues
+    );
+    let thick = plan_solid(&part, &rough, None, &SolidCut { skin: 15.0, ..cut }, &m).unwrap();
+    assert!(thick.operations.is_empty() && thick.issues[0].severity == Severity::Error, "{:?}", thick.issues);
+
+    // Hostile input is an error, never a panic.
+    assert!(plan_solid(&part, &ball(6.0), None, &cut, &m).is_err());
+    let mut drill = one_flute(6.0);
+    drill.kind = ToolKind::Drill;
+    assert!(plan_solid(&part, &rough, Some(&drill), &cut, &m).is_err());
+    for bad in [f64::NAN, f64::INFINITY, -1.0, 1.0e9] {
+        for f in 0..7 {
+            let mut c = cut;
+            match f {
+                0 => c.margin = bad,
+                1 => c.stock_top = bad,
+                2 => c.finish_stock = bad,
+                3 => c.skin = bad,
+                4 => c.finish_stepover = Some(bad),
+                5 => c.clearance = bad,
+                _ => c.retract = bad,
+            }
+            assert!(plan_solid(&part, &rough, None, &c, &m).is_err(), "field {f} = {bad}");
+        }
+    }
+    let far = Surface::new(vec![[Vec3::new(0.0, 0.0, 0.0), Vec3::new(5.0e5, 0.0, 0.0), Vec3::new(0.0, 5.0e5, -5.0)]]).unwrap();
+    assert!(plan_solid(&far, &rough, None, &cut, &m).is_err());
+    // A flat sheet has no height to cut.
+    let flat = Surface::new(vec![[Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0), Vec3::new(0.0, 10.0, 0.0)]]).unwrap();
+    let nothing = plan_solid(&flat, &rough, None, &cut, &m).unwrap();
+    assert!(nothing.operations.is_empty() && nothing.issues[0].severity == Severity::Error, "{:?}", nothing.issues);
 }

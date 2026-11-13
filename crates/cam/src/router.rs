@@ -13,6 +13,7 @@ use crate::{CamError, Move, Post, Program, Result, SafeRetract, invalid};
 
 pub mod auto;
 pub mod feeds;
+pub mod solid;
 
 /// The largest value any length, feed or speed of a profile may have: far beyond any machine,
 /// small enough that arithmetic on it stays finite.
