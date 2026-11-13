@@ -12,6 +12,9 @@
 //! come loose under the cutter: three to eight round it by its size, where both passes leave
 //! them. An outline too small for them is cut without, and the plan says so.
 //!
+//! Pockets ([`Pocket`]) are recesses cut to a depth, not through: they are cut before the
+//! openings, cleared and then finished round their walls and islands as an opening is.
+//!
 //! A region lying in an opening of another is the material that opening removes, not a part
 //! of its own (a sketch of a plate with a hole gives both the plate and the hole's disc).
 //!
@@ -112,6 +115,15 @@ impl PartCut {
     }
 }
 
+/// Recesses of one depth: each region is cleared to `depth` below the plate's top, its holes
+/// left standing as islands.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Pocket {
+    pub regions: Vec<Region2>,
+    /// Depth below the plate's top (mm), less than the plate's thickness.
+    pub depth: f64,
+}
+
 /// The operations of a part, in the order they are cut, and what could not be done as asked.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Planned {
@@ -151,16 +163,62 @@ fn even_stepdown(total: f64, deepest: f64) -> f64 {
     total / passes
 }
 
+/// What lies in an opening of another of `regions` is that opening's waste (or, of a pocket,
+/// the island's own top): the regions that are not.
+fn outermost(regions: &[Region2]) -> Vec<&Region2> {
+    let nested = |b: &Region2| {
+        let p = b.interior_point();
+        regions.iter().any(|a| !std::ptr::eq(a, b) && a.outer.contains(p) && !a.contains(p))
+    };
+    regions.iter().filter(|r| !nested(r)).collect()
+}
+
+/// A recess to cut: an opening through the plate or a pocket to its depth.
+struct Recess {
+    name: String,
+    region: Region2,
+    depth: f64,
+    /// What it is called in a message.
+    kind: &'static str,
+}
+
+/// `recesses` in the order they are cut: each the nearest to the one before it, from `at`,
+/// which is left at the last.
+fn nearest_first(mut recesses: Vec<Recess>, at: &mut Vec2) -> Vec<Recess> {
+    let mut out = Vec::with_capacity(recesses.len());
+    while !recesses.is_empty() {
+        let from = *at;
+        let dist = |r: &Recess| {
+            let p = middle(&r.region.outer);
+            (p.x - from.x).powi(2) + (p.y - from.y).powi(2)
+        };
+        let nearest = recesses.iter().enumerate().min_by(|a, b| dist(a.1).total_cmp(&dist(b.1))).map_or(0, |(k, _)| k);
+        let next = recesses.swap_remove(nearest);
+        *at = middle(&next.region.outer);
+        out.push(next);
+    }
+    out
+}
+
 /// The operations that cut `regions` out of plate with `tool` on `machine`.
 pub fn plan_part(regions: &[Region2], tool: &Tool, cut: &PartCut, machine: &MachineProfile) -> Result<Planned> {
+    plan_part_with(regions, &[], tool, cut, machine)
+}
+
+/// [`plan_part`] with `pockets` cut into the part first.
+pub fn plan_part_with(regions: &[Region2], pockets: &[Pocket], tool: &Tool, cut: &PartCut, machine: &MachineProfile) -> Result<Planned> {
     cut.validate()?;
     machine.validate()?;
     tool.validate()?;
     if regions.is_empty() {
         return invalid("a part needs at least one closed outline");
     }
-    if regions.iter().map(|r| 1 + r.holes.len()).sum::<usize>() > MAX_LOOPS {
-        return Err(CamError::TooLarge(format!("a part of more than {MAX_LOOPS} outlines and openings")));
+    let loops = |rs: &[Region2]| rs.iter().map(|r| 1 + r.holes.len()).sum::<usize>();
+    if loops(regions) + pockets.iter().map(|p| loops(&p.regions)).sum::<usize>() > MAX_LOOPS {
+        return Err(CamError::TooLarge(format!("a part of more than {MAX_LOOPS} outlines, openings and pockets")));
+    }
+    if pockets.iter().any(|p| !(p.depth > 0.0) || !p.depth.is_finite()) {
+        return invalid("a pocket's depth must be above 0");
     }
     let d = tool.diameter;
     let ask = |kind: CutKind| -> Result<Recipe> {
@@ -171,17 +229,16 @@ pub fn plan_part(regions: &[Region2], tool: &Tool, cut: &PartCut, machine: &Mach
     };
     let (slot, clear, finish) = (ask(CutKind::Slot)?, ask(CutKind::Pocket)?, ask(CutKind::Finish)?);
     let total = cut.thickness + cut.break_through;
-    let heights = Heights { clearance: cut.top + cut.clearance, retract: cut.top + cut.retract, top: cut.top, bottom: cut.top - total };
-    let passes =
-        |r: &Recipe, deepest: f64| Cut { heights, feeds: Feeds { cut: r.feed, plunge: r.ramp_feed }, stepdown: even_stepdown(total, deepest) };
+    let levels = |depth: f64| Heights { clearance: cut.top + cut.clearance, retract: cut.top + cut.retract, top: cut.top, bottom: cut.top - depth };
+    let passes_to = |r: &Recipe, deepest: f64, depth: f64| Cut {
+        heights: levels(depth),
+        feeds: Feeds { cut: r.feed, plunge: r.ramp_feed },
+        stepdown: even_stepdown(depth, deepest),
+    };
+    let passes = |r: &Recipe, deepest: f64| passes_to(r, deepest, total);
     let wall = |side: Side, stock: f64| ContourParams { side, climb: true, stock_to_leave: stock, tolerance: TOLERANCE, ramp_angle: cut.ramp_angle };
 
-    // What lies in another region's opening is that opening's waste.
-    let in_opening = |b: &Region2| {
-        let p = b.interior_point();
-        regions.iter().any(|a| !std::ptr::eq(a, b) && a.outer.contains(p) && !a.contains(p))
-    };
-    let parts: Vec<&Region2> = regions.iter().filter(|r| !in_opening(r)).collect();
+    let parts = outermost(regions);
     if parts.is_empty() {
         return invalid("a part needs an outline that is not inside another's opening");
     }
@@ -201,40 +258,58 @@ pub fn plan_part(regions: &[Region2], tool: &Tool, cut: &PartCut, machine: &Mach
             }
         }
     }
-    let add = |plan: &mut Planned, name: String, rpm: f64, path: crate::Toolpath| -> Result<()> {
-        verify(&path, &heights)?;
+    let add = |plan: &mut Planned, name: String, rpm: f64, path: crate::Toolpath, depth: f64| -> Result<()> {
+        verify(&path, &levels(depth))?;
         plan.operations.push(Operation { name, tool: tool.clone(), spindle_rpm: rpm, coolant: cut.coolant, path });
         Ok(())
     };
 
-    // Openings first, each from the one before it.
-    let mut openings: Vec<(String, Region2)> = Vec::new();
-    for (i, region) in parts.iter().enumerate() {
-        for (j, hole) in region.holes.iter().enumerate() {
-            let outer = hole.ccw();
-            let name = if parts.len() > 1 { format!("Part {} opening {}", i + 1, j + 1) } else { format!("Opening {}", j + 1) };
-            openings.push((name, Region2 { outer, holes: vec![] }));
+    // Pockets while the plate is whole, then the openings, each from the one before it.
+    let mut wanted: Vec<Recess> = Vec::new();
+    let several = pockets.iter().map(|p| outermost(&p.regions).len()).sum::<usize>() > 1;
+    for pocket in pockets {
+        for region in outermost(&pocket.regions) {
+            let name = if several { format!("Pocket {}", wanted.len() + 1) } else { "Pocket".to_string() };
+            if pocket.depth >= cut.thickness {
+                plan.issues.push(Issue::error(
+                    Some(name),
+                    format!(
+                        "a pocket {:.2} mm deep goes through the {:.2} mm plate: draw it in the outline's sketch, where it is an opening",
+                        pocket.depth, cut.thickness
+                    ),
+                ));
+                return Ok(plan);
+            }
+            if !parts.iter().any(|part| part.contains(region.interior_point())) {
+                plan.issues.push(Issue::warning(Some(name.clone()), "this pocket is not inside the part's outline"));
+            }
+            let region = Region2 { outer: region.outer.ccw(), holes: region.holes.clone() };
+            wanted.push(Recess { name, region, depth: pocket.depth, kind: "pocket" });
         }
     }
     let mut at = Vec2 { x: 0.0, y: 0.0 };
-    while !openings.is_empty() {
-        let dist = |p: Vec2| (p.x - at.x).powi(2) + (p.y - at.y).powi(2);
-        let nearest =
-            openings.iter().enumerate().min_by(|a, b| dist(middle(&a.1.1.outer)).total_cmp(&dist(middle(&b.1.1.outer)))).map_or(0, |(k, _)| k);
-        let (name, opening) = openings.swap_remove(nearest);
-        at = middle(&opening.outer);
-        let one = std::slice::from_ref(&opening);
+    let mut recesses = nearest_first(wanted, &mut at);
+    let mut openings: Vec<Recess> = Vec::new();
+    for (i, region) in parts.iter().enumerate() {
+        for (j, hole) in region.holes.iter().enumerate() {
+            let name = if parts.len() > 1 { format!("Part {} opening {}", i + 1, j + 1) } else { format!("Opening {}", j + 1) };
+            openings.push(Recess { name, region: Region2 { outer: hole.ccw(), holes: vec![] }, depth: total, kind: "opening" });
+        }
+    }
+    recesses.extend(nearest_first(openings, &mut at));
+    for Recess { name, region, depth, kind } in recesses {
+        let one = std::slice::from_ref(&region);
         if offset_regions(one, d / 2.0, TOLERANCE)?.is_empty() {
             plan.issues.push(Issue::warning(
                 Some(name),
-                format!("the {d:.3} mm cutter does not fit this opening: it is left uncut, for a smaller cutter or a drill"),
+                format!("the {d:.3} mm cutter does not fit this {kind}: it is left uncut, for a smaller cutter or a drill"),
             ));
             continue;
         }
         if offset_regions(one, d / 2.0 + cut.finish_stock, TOLERANCE)?.is_empty() {
             // No room to rough and finish: the wall is cut in depth passes as a slot is.
-            let path = contour(one, tool, &wall(Side::Inside, 0.0), &passes(&slot, slot.depth))?;
-            add(&mut plan, name, slot.rpm, path)?;
+            let path = contour(one, tool, &wall(Side::Inside, 0.0), &passes_to(&slot, slot.depth, depth))?;
+            add(&mut plan, name, slot.rpm, path, depth)?;
             continue;
         }
         let params = PocketParams {
@@ -244,10 +319,10 @@ pub fn plan_part(regions: &[Region2], tool: &Tool, cut: &PartCut, machine: &Mach
             tolerance: TOLERANCE,
             ramp_angle: cut.ramp_angle,
         };
-        let rough = pocket(one, tool, &params, &passes(&clear, clear.depth))?;
-        add(&mut plan, format!("{name} rough"), clear.rpm, rough)?;
-        let done = contour(one, tool, &wall(Side::Inside, 0.0), &passes(&finish, finish.depth))?;
-        add(&mut plan, format!("{name} finish"), finish.rpm, done)?;
+        let rough = pocket(one, tool, &params, &passes_to(&clear, clear.depth, depth))?;
+        add(&mut plan, format!("{name} rough"), clear.rpm, rough, depth)?;
+        let done = contour(one, tool, &wall(Side::Inside, 0.0), &passes_to(&finish, finish.depth, depth))?;
+        add(&mut plan, format!("{name} finish"), finish.rpm, done, depth)?;
     }
 
     // Outlines last: once one is through, nothing but tabs, screws or tape holds the part.
@@ -276,8 +351,8 @@ pub fn plan_part(regions: &[Region2], tool: &Tool, cut: &PartCut, machine: &Mach
                 }
             },
         };
-        add(&mut plan, format!("{name} rough"), slot.rpm, rough)?;
-        add(&mut plan, format!("{name} finish"), finish.rpm, done)?;
+        add(&mut plan, format!("{name} rough"), slot.rpm, rough, total)?;
+        add(&mut plan, format!("{name} finish"), finish.rpm, done, total)?;
     }
     Ok(plan)
 }

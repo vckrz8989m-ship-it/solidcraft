@@ -3,7 +3,7 @@ use std::f64::consts::PI;
 use solidcore_record::{Loop2, Region2, Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
-use crate::router::auto::{Hold, PartCut, plan_part};
+use crate::router::auto::{Hold, PartCut, Pocket, plan_part, plan_part_with};
 use crate::router::feeds::{CutKind, FeedRequest, Material, Recipe, Tier, chip_thinning, recipe};
 use crate::router::{MachineProfile, Severity, check_program, check_text, check_travel};
 use crate::*;
@@ -482,4 +482,62 @@ fn hostile_parts_and_cuts_are_errors_never_panics() {
     assert!(plan_part(&nothing, &tool, &good, &m).is_err());
     let many = [Region2 { outer: plate_with(&[])[0].outer.clone(), holes: vec![Loop2::circle(v(5.0, 5.0), 1.0); 2001] }];
     assert!(plan_part(&many, &tool, &good, &m).is_err());
+}
+
+#[test]
+fn pockets_are_cut_to_their_depth_before_the_openings_and_round_their_islands() {
+    let m = machine();
+    let tool = one_flute(6.0);
+    let cut = PartCut::new(Material::Aluminum, 6.0);
+    let part = plate_with(&[(48.0, 20.0, 5.0)]);
+    // A 24 × 24 mm pocket 2 mm deep with a 6 mm boss left standing in its middle, drawn as a
+    // sketch gives it: the ring, and the boss's disc as a region of its own.
+    let square = Loop2::polygon(&[v(6.0, 8.0), v(30.0, 8.0), v(30.0, 32.0), v(6.0, 32.0)]);
+    let boss = Loop2::circle(v(18.0, 20.0), 3.0);
+    let drawn = vec![Region2 { outer: square.clone(), holes: vec![boss.reversed()] }, Region2 { outer: boss.clone(), holes: vec![] }];
+    let plan = plan_part_with(&part, &[Pocket { regions: drawn, depth: 2.0 }], &tool, &cut, &m).unwrap();
+    let names: Vec<&str> = plan.operations.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(names, ["Pocket rough", "Pocket finish", "Opening 1 rough", "Opening 1 finish", "Outside rough", "Outside finish"]);
+    assert_eq!(plan.issues, []);
+    for op in &plan.operations[..2] {
+        let cutting: Vec<Vec3> = op.path.points(0.01).into_iter().filter(|(_, c)| *c).map(|(p, _)| p).collect();
+        let low = cutting.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+        close(low, -2.0, 1e-6);
+        for p in cutting.iter().filter(|p| p.z < 0.0) {
+            // The cutter's centre stays 3 mm inside the walls and 3 mm off the boss.
+            assert!(p.x > 9.0 - 0.01 && p.x < 27.0 + 0.01 && p.y > 11.0 - 0.01 && p.y < 29.0 + 0.01, "{}: {p:?} is in the wall", op.name);
+            assert!((p.x - 18.0).hypot(p.y - 20.0) > 6.0 - 0.01, "{}: {p:?} is in the boss", op.name);
+        }
+    }
+    // The finishing pass goes round the walls and round the boss.
+    let finish: Vec<Vec3> =
+        plan.operations[1].path.points(0.01).into_iter().filter(|(p, c)| *c && (p.z + 2.0).abs() < 1e-6).map(|(p, _)| p).collect();
+    assert!(finish.iter().any(|p| (p.x - 9.0).abs() < 0.01) && finish.iter().any(|p| ((p.x - 18.0).hypot(p.y - 20.0) - 6.0).abs() < 0.01));
+    let program = Program { name: "plate".into(), operations: plan.operations, ..Program::default() };
+    assert!(check_program(&program, &m).unwrap().iter().all(|i| i.severity != Severity::Error));
+
+    // Two pockets are numbered and cut nearest first; one the cutter does not fit is left and said.
+    let disc = |x: f64, y: f64, r: f64| Region2 { outer: Loop2::circle(v(x, y), r), holes: vec![] };
+    let pockets = [
+        Pocket { regions: vec![disc(50.0, 30.0, 6.0), disc(12.0, 10.0, 6.0)], depth: 3.0 },
+        Pocket { regions: vec![disc(30.0, 30.0, 2.0)], depth: 1.0 },
+    ];
+    let plan = plan_part_with(&plate_with(&[]), &pockets, &tool, &cut, &m).unwrap();
+    let names: Vec<&str> = plan.operations.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(names[..4], ["Pocket 2 rough", "Pocket 2 finish", "Pocket 1 rough", "Pocket 1 finish"]);
+    assert!(plan.issues.iter().any(|i| i.at.as_deref() == Some("Pocket 3") && i.message.contains("does not fit this pocket")), "{:?}", plan.issues);
+
+    // A pocket as deep as the plate is an opening drawn in the wrong sketch: an error, nothing cut.
+    let through = plan_part_with(&plate_with(&[]), &[Pocket { regions: vec![disc(30.0, 20.0, 8.0)], depth: 6.0 }], &tool, &cut, &m).unwrap();
+    assert!(through.operations.is_empty());
+    assert!(through.issues.iter().any(|i| i.severity == Severity::Error && i.message.contains("goes through")), "{:?}", through.issues);
+    // One beside the part is cut as asked, with a warning.
+    let beside = plan_part_with(&plate_with(&[]), &[Pocket { regions: vec![disc(100.0, 20.0, 8.0)], depth: 2.0 }], &tool, &cut, &m).unwrap();
+    assert!(beside.issues.iter().any(|i| i.message.contains("not inside the part's outline")), "{:?}", beside.issues);
+    for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+        assert!(
+            plan_part_with(&plate_with(&[]), &[Pocket { regions: vec![disc(30.0, 20.0, 8.0)], depth: bad }], &tool, &cut, &m).is_err(),
+            "depth {bad}"
+        );
+    }
 }

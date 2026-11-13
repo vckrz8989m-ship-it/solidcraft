@@ -5840,6 +5840,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     overlays(app, &painter, &proj);
     paint_device_pivot(app, &painter, &proj);
     draw_notes(app, &painter, &proj);
+    crate::dialogs_cut_out::show(app, &painter, &proj);
     crate::dim_view::show(app, ui, &painter, &proj);
     crate::sketch_text_handles::show(app, ui, &painter, &proj, hover);
     crate::sketch3d::show(app, &painter, &proj);

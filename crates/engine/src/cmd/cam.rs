@@ -5,15 +5,15 @@
 
 use serde_json::{Value, json};
 use solidcore_record::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
-use solidcraft_cam::router::auto::{PartCut, Planned, plan_part};
+use solidcraft_cam::router::auto::{PartCut, Planned, Pocket, plan_part_with};
 use solidcraft_cam::router::feeds::{CutKind, FeedRequest, Material, Tier, recipe};
 use solidcraft_cam::router::{Issue, MachineProfile, Severity, check_program, check_text, check_travel};
 use solidcraft_cam::{
     ContourParams, Cut, Feeds, Heights, Move, Operation, PocketParams, Post, Program, Side, Tool, ToolKind, contour, emit, pocket, readback,
 };
 use solidcraft_doc::cam::{
-    CamContourParams, CamCut, CamFaceRef, CamGeometry, CamOperation, CamPocketParams, CamSettings, CamSetup, CamSide, MAX_OPS, MAX_SETUPS, MAX_TOOLS,
-    PolygonRegion, StockBox, WcsOriginMode, default_contour_params, default_cut, default_pocket_params,
+    CamContourParams, CamCut, CamFaceRef, CamGeometry, CamOperation, CamPartPocket, CamPocketParams, CamSettings, CamSetup, CamSide, MAX_OPS,
+    MAX_SETUPS, MAX_TOOLS, PolygonRegion, StockBox, WcsOriginMode, default_contour_params, default_cut, default_pocket_params,
 };
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::project::resolve_face_indices;
@@ -56,6 +56,8 @@ pub static COMMANDS: &[CommandSpec] = &[
          tier?: careful|standard|bold (default standard); top? (the plate's top, default 0); finish_stock? (default 0.2 mm); \
          break_through? (below the plate, default 0.2 mm); coolant?: bool (default true); \
          hold?: tabs|none (default tabs: three to eight holding tabs are left round the outside); \
+         pockets?: [{sketch | faces | outer | regions, depth}] (recesses cut depth deep from the top, before the openings; \
+         what is drawn inside one is left standing); \
          machine?: (default flexihal-router; what the plan is tried on, cam.post names the one it is written for) → \
          {setup, operation, cuts: [names in cutting order], issues}. Every opening the tool fits is roughed and \
          finished, nearest first, then the outside is, at the machine's feeds; the cuts are planned again when posting.",
@@ -64,10 +66,11 @@ pub static COMMANDS: &[CommandSpec] = &[
         "sketch?: id or name (default the newest sketch), with profiles?; faces?; or outer/regions; holes?; \
          material: aluminum|aluminum_soft|brass|acrylic|soft_plastic|hardwood|softwood; thickness (of the plate); \
          tool?: number of a defined tool, or tool_diameter with flutes? (default 1) and flute_length? (default 3 diameters): \
-         a tool of that size is used, or defined under the next free number; tier?: careful|standard|bold; hold?: tabs|none; \
+         a tool of that size is used, or defined under the next free number; tier?: careful|standard|bold; hold?: tabs|none; pockets?: [{sketch, depth}] as cam.op.part; \
          name?: the operation's (default the sketch's name); setup?: (default Router, made when missing: work zero at the \
          sketch origin, Z 0 on the plate's top); machine?: (default flexihal-router); path?: file the G-code is written to; \
-         dry_run?: bool (plan and check only: nothing is kept in the design or written) → \
+         dry_run?: bool (plan and check only: nothing is kept in the design or written); \
+         paths?: bool (also reply paths: [{name, points: [[x, y, z, cutting 1|0]]}] in model coordinates, to draw) → \
          {setup, operation, tool, cuts: [{name, rpm, feed}] in cutting order, issues, extents, gcode, readback, path?}. One step from a drawn outline to a \
          checked program of that part alone: the part is kept in the setup as cam.op.part would keep it.",
     ),
@@ -382,6 +385,7 @@ fn part_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         break_through: expr(p, "break_through").unwrap_or_else(|| Expr::new("0.2 mm")),
         coolant: bool_(p, "coolant").unwrap_or(true),
         hold: word(cmd, p, "hold", "tabs or none")?.unwrap_or_default(),
+        pockets: pockets_param(s, cmd, p)?,
     };
     op.validate().map_err(|e| bad(cmd, e.to_string()))?;
     let setup = s.doc.cam.setup(&setup_name).cloned().ok_or_else(|| bad(cmd, format!("no setup `{setup_name}` (cam.setup first)")))?;
@@ -398,12 +402,34 @@ fn part_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// A part's pockets: `pockets: [{sketch | faces | outer | regions, depth}]`.
+fn pockets_param(s: &Session, cmd: &str, p: &Value) -> Result<Vec<CamPartPocket>> {
+    let list = match p.get("pockets") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(list)) => list,
+        Some(_) => return Err(bad(cmd, "`pockets` must be a list of {sketch, depth}")),
+    };
+    if list.len() > solidcraft_doc::cam::MAX_PART_POCKETS {
+        return Err(bad(cmd, format!("a part has at most {} pocket depths", solidcraft_doc::cam::MAX_PART_POCKETS)));
+    }
+    let mut out = Vec::with_capacity(list.len());
+    for entry in list {
+        if !entry.is_object() {
+            return Err(bad(cmd, "each of `pockets` must be {sketch, depth}"));
+        }
+        let depth =
+            expr(entry, "depth").ok_or_else(|| bad(cmd, format!("a pocket's `depth` {}", crate::params::expr_problem(entry.get("depth")))))?;
+        out.push(CamPartPocket { geometry: geometry_param(s, cmd, entry)?, depth });
+    }
+    Ok(out)
+}
+
 /// The machine a part is planned for when none is named.
 const DEFAULT_MACHINE: &str = "flexihal-router";
 
 /// The cuts of a part operation on `machine`, named after it (`Plate: Outside rough`).
 fn plan_op(s: &Session, setup: &CamSetup, op: &CamOperation, tool: &Tool, machine: &MachineProfile) -> std::result::Result<Planned, String> {
-    let CamOperation::Part { name, geometry, material, thickness, tier, top, finish_stock, break_through, coolant, hold, .. } = op else {
+    let CamOperation::Part { name, geometry, material, thickness, tier, top, finish_stock, break_through, coolant, hold, pockets, .. } = op else {
         return Err(format!("`{}` is not a part operation", op.name()));
     };
     let regions = resolve_geometry(s, setup, geometry)?;
@@ -414,7 +440,11 @@ fn plan_op(s: &Session, setup: &CamSetup, op: &CamOperation, tool: &Tool, machin
     cut.break_through = eval_len(s, break_through, "break_through")?;
     cut.coolant = *coolant;
     cut.hold = *hold;
-    let mut plan = plan_part(&regions, tool, &cut, machine).map_err(|e| e.to_string())?;
+    let mut recesses = Vec::with_capacity(pockets.len());
+    for pocket in pockets {
+        recesses.push(Pocket { regions: resolve_geometry(s, setup, &pocket.geometry)?, depth: eval_len(s, &pocket.depth, "pocket depth")? });
+    }
+    let mut plan = plan_part_with(&regions, &recesses, tool, &cut, machine).map_err(|e| e.to_string())?;
     for o in &mut plan.operations {
         o.name = format!("{name}: {}", o.name);
     }
@@ -715,6 +745,7 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     let setup_name = str_(p, "setup").map(str::trim).filter(|n| !n.is_empty() && n.len() <= 128).unwrap_or("Router").to_string();
     let machine = machine_named(cmd, str_(p, "machine").unwrap_or(DEFAULT_MACHINE))?;
     let dry_run = bool_(p, "dry_run").unwrap_or(false);
+    let with_paths = bool_(p, "paths").unwrap_or(false);
     // What is cut: what the caller named, else the newest sketch.
     let mut source = if p.is_object() { p.clone() } else { json!({}) };
     if !["sketch", "faces", "outer", "regions"].iter().any(|k| p.get(*k).is_some()) {
@@ -798,12 +829,36 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         break_through: expr(p, "break_through").unwrap_or_else(|| Expr::new("0.2 mm")),
         coolant: bool_(p, "coolant").unwrap_or(true),
         hold: word(cmd, p, "hold", "tabs or none")?.unwrap_or_default(),
+        pockets: pockets_param(s, cmd, p)?,
     };
     op.validate().map_err(|e| bad(cmd, e.to_string()))?;
     // Everything is planned, written and checked before the design is touched.
     let plan = plan_op(s, &setup, &op, &tool, &machine).map_err(|e| bad(cmd, e))?;
     let cuts: Vec<Value> = plan.operations.iter().map(|o| json!({"name": o.name, "rpm": o.spindle_rpm, "feed": top_feed(&o.path)})).collect();
     let program = Program { name: name.clone(), operations: plan.operations, work_offset: Some(setup.work_offset) };
+    // The paths in the model, for a front end to draw over the part.
+    let paths = if with_paths {
+        let frame = work_frame(&setup).map_err(|e| bad(cmd, e))?;
+        let ops: Vec<Value> = program
+            .operations
+            .iter()
+            .map(|o| {
+                let points: Vec<[f64; 4]> = o
+                    .path
+                    .points(0.05)
+                    .into_iter()
+                    .map(|(at, cutting)| {
+                        let w = frame.world(at);
+                        [w.x, w.y, w.z, f64::from(u8::from(cutting))]
+                    })
+                    .collect();
+                json!({"name": o.name, "points": points})
+            })
+            .collect();
+        Some(ops)
+    } else {
+        None
+    };
     let post = machine.post().map_err(|e| bad(cmd, e.to_string()))?;
     let path = if dry_run { None } else { path_param(cmd, p)? };
     let mut out = write_program(cmd, &program, &post, Some(&machine), plan.issues, None, path)?;
@@ -811,6 +866,9 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     out["operation"] = json!(name);
     out["tool"] = json!(tool);
     out["cuts"] = json!(cuts);
+    if let Some(paths) = paths {
+        out["paths"] = json!(paths);
+    }
     if dry_run {
         out["dry_run"] = json!(true);
         return Ok(out);
@@ -934,6 +992,11 @@ impl WorkFrame {
     fn local(&self, p: Vec3) -> Vec3 {
         let d = p - self.o;
         Vec3::new(d.dot(self.x), d.dot(self.y), d.dot(self.z))
+    }
+
+    /// The model point of work coordinates `p`.
+    fn world(&self, p: Vec3) -> Vec3 {
+        self.o + self.x * p.x + self.y * p.y + self.z * p.z
     }
 }
 
@@ -1180,9 +1243,10 @@ fn setup_json(setup: &CamSetup) -> Value {
                 "type": "pocket", "name": name, "tool": tool, "geometry": geometry,
                 "params": params, "cut": cut, "spindle_rpm": spindle_rpm, "coolant": coolant,
             }),
-            CamOperation::Part { name, tool, geometry, material, thickness, tier, top, finish_stock, break_through, coolant, hold } => json!({
+            CamOperation::Part { name, tool, geometry, material, thickness, tier, top, finish_stock, break_through, coolant, hold, pockets } => json!({
                 "type": "part", "name": name, "tool": tool, "geometry": geometry, "material": material, "thickness": thickness,
                 "tier": tier, "top": top, "finish_stock": finish_stock, "break_through": break_through, "coolant": coolant, "hold": hold,
+                "pockets": pockets,
             }),
         }).collect::<Vec<_>>(),
     })
@@ -1446,6 +1510,48 @@ mod tests {
         );
         assert!(tried["path"].is_null() && !dir.join("never.nc").exists());
         assert!(std::sync::Arc::ptr_eq(&s.doc, &kept), "a dry run leaves the design alone, with no undo step");
+
+        // A second sketch gives the pockets: cut first, 2 mm deep, and kept with the part.
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.circle.center", json!({"center": [10, 30], "radius": 5}));
+        let recess = s.active_sketch.expect("sketch");
+        run(&mut s, "sketch.finish", json!({}));
+        let mut pocketed = ask.clone();
+        pocketed["sketch"] = json!(sketch);
+        pocketed["pockets"] = json!([{"sketch": recess, "depth": "2 mm"}]);
+        pocketed["paths"] = json!(true);
+        let cut = run(&mut s, "cam.cut_out", pocketed.clone());
+        let names: Vec<&str> = cut["cuts"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+        assert_eq!(names.len(), 6, "{names:?}");
+        assert!(names[0].ends_with("Pocket rough") && names[1].ends_with("Pocket finish") && names[5].ends_with("Outside finish"), "{names:?}");
+        assert!(cut["gcode"].as_str().unwrap().contains("Z-2\n") || cut["gcode"].as_str().unwrap().contains("Z-2 "), "{}", cut["gcode"]);
+        // Its paths come back in the model, one list a cut: the pocket's lowest point is 2 mm down.
+        let paths = cut["paths"].as_array().unwrap();
+        assert_eq!(paths.len(), 6);
+        let low = paths[0]["points"].as_array().unwrap().iter().filter_map(|p| p[2].as_f64()).fold(f64::INFINITY, f64::min);
+        assert!((low + 2.0).abs() < 1e-6, "{low}");
+        assert!(
+            paths[0]["points"].as_array().unwrap().iter().any(|p| p[3] == 1.0) && paths[0]["points"].as_array().unwrap().iter().any(|p| p[3] == 0.0)
+        );
+        assert_eq!(run(&mut s, "cam.list", json!({}))["setups"][0]["operations"][0]["pockets"][0]["depth"], "2 mm");
+        for (pockets, why) in [
+            (json!([{"sketch": recess, "depth": "6 mm"}]), "goes through"),
+            (json!([{"sketch": recess}]), "a pocket's `depth`"),
+            (json!([{"sketch": 99999, "depth": 2}]), "no sketch"),
+            (json!([7]), "each of `pockets`"),
+            (json!("all"), "`pockets` must be a list"),
+        ] {
+            let mut bad_ask = pocketed.clone();
+            bad_ask["pockets"] = pockets;
+            let e = s.execute("cam.cut_out", &bad_ask).unwrap_err().to_string();
+            assert!(e.contains(why), "{bad_ask}: {e}");
+        }
+        // Without pockets asked again, the part is kept without them. (The plate's sketch is named
+        // from here on: the newest sketch is now the pocket's.)
+        let mut ask = ask.clone();
+        ask["sketch"] = json!(sketch);
+        run(&mut s, "cam.cut_out", ask.clone());
+        assert_eq!(run(&mut s, "cam.list", json!({}))["setups"][0]["operations"][0]["pockets"], json!([]));
 
         // Asked again, the same tool, setup and operation are used, not added to.
         let mut thinner = ask.clone();

@@ -26,6 +26,8 @@ pub const MAX_LOOP_POINTS: usize = 10_000;
 pub const MAX_HOLES: usize = 1_000;
 /// Most regions in one operation.
 pub const MAX_REGIONS: usize = 256;
+/// Most pocket depths in one part operation.
+pub const MAX_PART_POCKETS: usize = 32;
 
 /// The design's CAM data: tools, setups and optional named posts.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -794,7 +796,18 @@ pub enum CamOperation {
         /// What keeps the part in place while its outside is cut through.
         #[serde(default, skip_serializing_if = "is_tabs")]
         hold: Hold,
+        /// Recesses cut into the part before its openings.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pockets: Vec<CamPartPocket>,
     },
+}
+
+/// Recesses of one depth in a part: the closed shapes of `geometry`, cut `depth` deep from the
+/// plate's top, with what is drawn inside a shape left standing as an island.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CamPartPocket {
+    pub geometry: CamGeometry,
+    pub depth: Expr,
 }
 
 impl CamOperation {
@@ -853,11 +866,18 @@ impl CamOperation {
                 check_expr(&params.ramp_angle, "ramp_angle")?;
                 check_spindle(*spindle_rpm)?;
             }
-            CamOperation::Part { thickness, top, finish_stock, break_through, .. } => {
+            CamOperation::Part { thickness, top, finish_stock, break_through, pockets, .. } => {
                 check_expr(thickness, "thickness")?;
                 check_expr(top, "top")?;
                 check_expr(finish_stock, "finish_stock")?;
                 check_expr(break_through, "break_through")?;
+                if pockets.len() > MAX_PART_POCKETS {
+                    return Err(DocError::Invalid(format!("a part has at most {MAX_PART_POCKETS} pocket depths")));
+                }
+                for pocket in pockets {
+                    pocket.geometry.validate()?;
+                    check_expr(&pocket.depth, "pocket depth")?;
+                }
             }
         }
         Ok(())
@@ -909,7 +929,17 @@ mod tests {
             (Tier::Standard, "0 mm", "0.2 mm", "0.2 mm", true)
         );
         assert_eq!(*hold, Hold::Tabs);
-        assert!(!serde_json::to_string(&op).unwrap().contains("hold"));
+        let written = serde_json::to_string(&op).unwrap();
+        assert!(!written.contains("hold") && !written.contains("pockets"), "{written}");
+        // Pockets are kept with their sketch and their depth, and a blank depth is refused.
+        let with =
+            text.replace(r#""thickness":"6 mm""#, r#""thickness":"6 mm","pockets":[{"geometry":{"type":"sketch","sketch":4},"depth":"2 mm"}]"#);
+        let pocketed: CamOperation = serde_json::from_str(&with).unwrap();
+        pocketed.validate().unwrap();
+        assert_eq!(serde_json::from_str::<CamOperation>(&serde_json::to_string(&pocketed).unwrap()).unwrap(), pocketed);
+        let CamOperation::Part { pockets, .. } = &pocketed else { panic!("not a part") };
+        assert_eq!((pockets.len(), pockets[0].depth.as_str()), (1, "2 mm"));
+        assert!(serde_json::from_str::<CamOperation>(&with.replace("2 mm", " ")).unwrap().validate().is_err());
         assert!(op.cut().is_none());
         op.validate().unwrap();
         let back: CamOperation = serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
@@ -926,6 +956,7 @@ mod tests {
             break_through: break_through_mm(),
             coolant: false,
             hold: Hold::None,
+            pockets: Vec::new(),
         };
         assert!(blank.validate().is_err());
     }

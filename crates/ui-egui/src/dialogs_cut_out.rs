@@ -1,7 +1,9 @@
 //! The Cut Out Part dialog (`cam.cut_out`): the sketch that is the part's outline, the plate
-//! (material and thickness) and the cutter, then a file dialog for the G-code. Check plans the
-//! cuts on a copy of the design and lists them with what the plan warns of; nothing is written
-//! or kept until Save G-code. The values start from the part the design last cut out.
+//! (material and thickness) and the cutter, then a file dialog for the G-code. A second sketch
+//! may give pockets: its closed shapes are cut to a depth before the openings. Check plans the
+//! cuts on a copy of the design, lists them with what the plan warns of and draws their paths
+//! over the part ([`show`]): cuts in the accent colour, moves between them faintly. Nothing is
+//! written or kept until Save G-code. The values start from the part the design last cut out.
 
 use serde_json::{Value, json};
 use solidcraft_engine::doc::FeatureKind;
@@ -10,6 +12,9 @@ use solidcraft_engine::doc::cam::CamOperation;
 use crate::SolveApp;
 use crate::dialogs::{Kind, combo, field, form_row};
 use crate::selection::SelInput;
+use solidcore_record::Vec3;
+use solidcraft_engine::doc::cam::CamGeometry;
+use solidcraft_theme::Tokens;
 
 /// The materials, as `cam.cut_out` names them, and their labels.
 const MATERIALS: [(&str, &str); 7] = [
@@ -28,6 +33,15 @@ const FLUTES: [&str; 4] = ["1", "2", "3", "4"];
 const HOLDS: [(&str, &str); 2] = [("tabs", "Holding tabs"), ("none", "None (screws or tape)")];
 /// The setup the dialog's parts are kept in.
 const SETUP: &str = "Router";
+/// Most points of a plan's paths drawn in a frame: past it, every few are.
+const MAX_DRAWN: usize = 60_000;
+
+/// A run of a planned path in the model: a cut, or the move to the next one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Run {
+    pub cutting: bool,
+    pub points: Vec<[f64; 3]>,
+}
 
 /// The dialog's values.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,6 +59,11 @@ pub struct CutOut {
     pub tier: usize,
     /// Index into [`HOLDS`].
     pub hold: usize,
+    /// The sketch whose closed shapes are pockets (a feature id; 0: none).
+    pub pocket_sketch: u64,
+    pub pocket_depth: String,
+    /// The paths of the plan Check last made, drawn over the part.
+    pub paths: Vec<Run>,
     /// What Check last found, a line each; the flag says the plan was refused.
     pub report: Vec<String>,
     pub refused: bool,
@@ -81,14 +100,28 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         flute_length: "18 mm".into(),
         tier: 1,
         hold: 0,
+        pocket_sketch: 0,
+        pocket_depth: "2 mm".into(),
+        paths: Vec::new(),
         report: Vec::new(),
         refused: false,
         report_of: String::new(),
     };
-    // The part cut out last gives the plate and the cutter; the sketch stays the newest.
+    // The part cut out last gives the plate, the cutter and, while they are still there, its sketches.
     let cam = &app.session.doc.cam;
     let last = cam.setup(SETUP).and_then(|s| s.operations.iter().rev().find(|op| matches!(op, CamOperation::Part { .. })));
-    if let Some(CamOperation::Part { tool, material, thickness, tier, hold, .. }) = last {
+    if let Some(CamOperation::Part { tool, material, thickness, tier, hold, geometry, pockets, .. }) = last {
+        let drawn = |g: &CamGeometry| match g {
+            CamGeometry::Sketch { sketch, .. } => sketches(app).iter().find(|s| s.0 == *sketch).map(|s| s.0),
+            _ => None,
+        };
+        if let Some(outline) = drawn(geometry) {
+            k.sketch = outline;
+        }
+        if let Some((sketch, depth)) = pockets.iter().find_map(|p| drawn(&p.geometry).map(|s| (s, p.depth.as_str()))) {
+            k.pocket_sketch = sketch;
+            k.pocket_depth = depth.to_owned();
+        }
         let word = |v: Value| v.as_str().map(str::to_owned).unwrap_or_default();
         let (material, tier, hold) = (word(json!(material)), word(json!(tier)), word(json!(hold)));
         k.material = MATERIALS.iter().position(|m| m.0 == material).unwrap_or(k.material);
@@ -113,7 +146,7 @@ fn params(k: &CutOut) -> Result<Value, String> {
         let value = value.trim();
         if value.is_empty() { Err(format!("{what} is empty")) } else { Ok(value.to_owned()) }
     };
-    Ok(json!({
+    let mut asked = json!({
         "sketch": k.sketch,
         "setup": SETUP,
         "material": MATERIALS.get(k.material).map_or("aluminum", |m| m.0),
@@ -123,7 +156,65 @@ fn params(k: &CutOut) -> Result<Value, String> {
         "flute_length": text(&k.flute_length, "Flute length")?,
         "tier": TIERS.get(k.tier).map_or("standard", |t| t.0),
         "hold": HOLDS.get(k.hold).map_or("tabs", |h| h.0),
-    }))
+    });
+    if k.pocket_sketch != 0 && k.pocket_sketch != k.sketch {
+        asked["pockets"] = json!([{"sketch": k.pocket_sketch, "depth": text(&k.pocket_depth, "Pocket depth")?}]);
+    }
+    Ok(asked)
+}
+
+/// A reply's paths as runs: each cut, and each move between cuts, a line of its own.
+fn runs(reply: &Value) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::new();
+    for path in reply["paths"].as_array().into_iter().flatten() {
+        let mut last: Option<[f64; 3]> = None;
+        for p in path["points"].as_array().into_iter().flatten() {
+            let (Some(x), Some(y), Some(z)) = (p[0].as_f64(), p[1].as_f64(), p[2].as_f64()) else { continue };
+            let (at, cutting) = ([x, y, z], p[3].as_f64() == Some(1.0));
+            match out.last_mut() {
+                Some(run) if run.cutting == cutting && last.is_some() => run.points.push(at),
+                // A new run starts where the tool was, so the lines join.
+                _ => out.push(Run { cutting, points: last.into_iter().chain([at]).collect() }),
+            }
+            last = Some(at);
+        }
+    }
+    out
+}
+
+/// The paths of the plan Check last made, over the part: cuts in the accent colour, the moves
+/// between them faintly. Drawn while the dialog's values are those the plan was made for.
+pub fn show(app: &SolveApp, painter: &egui::Painter, proj: &crate::viewport::Proj) {
+    let Some(Kind::CutOut(k)) = app.dialog.as_ref().map(|d| &d.kind) else { return };
+    if k.paths.is_empty() || k.refused || k.report_of != planned_for(app, k) {
+        return;
+    }
+    let (theme, view) = (Tokens::get(), Tokens::view());
+    let total: usize = k.paths.iter().map(|r| r.points.len()).sum();
+    let every = total.div_ceil(MAX_DRAWN).max(1);
+    for run in &k.paths {
+        let stroke = if run.cutting { egui::Stroke::new(1.5, theme.accent) } else { egui::Stroke::new(1.0, view.text.gamma_multiply(0.35)) };
+        let last = run.points.len().saturating_sub(1);
+        // What is behind the camera breaks the line; the rest is drawn.
+        let mut line: Vec<egui::Pos2> = Vec::new();
+        for (i, p) in run.points.iter().enumerate() {
+            if i % every != 0 && i != last {
+                continue;
+            }
+            match proj.to_screen(Vec3::new(p[0], p[1], p[2])) {
+                Some(at) => line.push(at),
+                None => {
+                    if line.len() > 1 {
+                        painter.add(egui::Shape::line(std::mem::take(&mut line), stroke));
+                    }
+                    line.clear();
+                }
+            }
+        }
+        if line.len() > 1 {
+            painter.add(egui::Shape::line(line, stroke));
+        }
+    }
 }
 
 fn number(v: &Value) -> String {
@@ -157,21 +248,33 @@ fn lines(reply: &Value) -> Vec<String> {
     out
 }
 
-/// Plan the cuts on a copy of the design: nothing is kept or written.
-fn check(app: &SolveApp, k: &CutOut) -> (Vec<String>, bool) {
+/// Plan the cuts on a copy of the design: nothing is kept or written. The report's lines,
+/// whether the plan was refused, and its paths.
+fn check(app: &SolveApp, k: &CutOut) -> (Vec<String>, bool, Vec<Run>) {
     let planned = params(k).and_then(|mut p| {
         p["dry_run"] = json!(true);
+        p["paths"] = json!(true);
         app.session.preview(&[("cam.cut_out".to_string(), p)]).map_err(|e| e.to_string())
     });
     match planned {
-        Ok(preview) => (preview.replies.first().map(lines).unwrap_or_default(), false),
-        Err(why) => (vec![why], true),
+        Ok(preview) => {
+            let reply = preview.replies.first();
+            (reply.map(lines).unwrap_or_default(), false, reply.map(runs).unwrap_or_default())
+        }
+        Err(why) => (vec![why], true, Vec::new()),
     }
 }
 
 /// What a plan depends on: the dialog's values and the design as it stands.
 fn planned_for(app: &SolveApp, k: &CutOut) -> String {
-    format!("{:?}", (app.session.revision, k.sketch, k.material, &k.thickness, &k.diameter, k.flutes, &k.flute_length, k.tier, k.hold))
+    format!(
+        "{:?}",
+        (
+            app.session.revision,
+            (k.sketch, k.pocket_sketch, &k.pocket_depth),
+            (k.material, &k.thickness, &k.diameter, k.flutes, &k.flute_length, k.tier, k.hold)
+        )
+    )
 }
 
 pub fn rows(app: &SolveApp, ui: &mut egui::Ui, k: &mut CutOut) -> bool {
@@ -189,6 +292,21 @@ pub fn rows(app: &SolveApp, ui: &mut egui::Ui, k: &mut CutOut) -> bool {
         combo(ui, "cut_out_sketch", &labels, &mut at);
         k.sketch = list.get(at).map_or(0, |s| s.0);
     });
+    // Pockets come from another sketch than the outline's: the first row is no pockets.
+    let others: Vec<&(u64, String)> = list.iter().filter(|s| s.0 != k.sketch).collect();
+    if !others.is_empty() {
+        form_row(ui, "Pocket sketch", |ui| {
+            let labels: Vec<&str> = std::iter::once(tr("No pockets")).chain(others.iter().map(|s| s.1.as_str())).collect();
+            let mut at = others.iter().position(|s| s.0 == k.pocket_sketch).map_or(0, |i| i + 1);
+            combo(ui, "cut_out_pocket_sketch", &labels, &mut at);
+            k.pocket_sketch = at.checked_sub(1).and_then(|i| others.get(i)).map_or(0, |s| s.0);
+        });
+    } else {
+        k.pocket_sketch = 0;
+    }
+    if k.pocket_sketch != 0 {
+        form_row(ui, "Pocket depth", |ui| enter |= field(ui, &mut k.pocket_depth));
+    }
     form_row(ui, "Material", |ui| {
         let labels: Vec<&str> = MATERIALS.iter().map(|m| tr(m.1)).collect();
         combo(ui, "cut_out_material", &labels, &mut k.material);
@@ -209,13 +327,14 @@ pub fn rows(app: &SolveApp, ui: &mut egui::Ui, k: &mut CutOut) -> bool {
     let now = planned_for(app, k);
     if k.report_of != now {
         k.report.clear();
+        k.paths.clear();
         k.refused = false;
     }
     form_row(ui, "Plan", |ui| {
         let r = crate::ui_kit::button(ui, tr("Check"), crate::ui_kit::Button::Normal);
         crate::scenario::publish_handle("dialog:cut_out:check", r.rect.center());
         if r.clicked() {
-            (k.report, k.refused) = check(app, k);
+            (k.report, k.refused, k.paths) = check(app, k);
             k.report_of = now.clone();
         }
     });
@@ -299,7 +418,7 @@ mod tests {
         h.frames(3);
         let k = form(&h);
         assert_eq!((k.material, k.thickness.as_str(), k.diameter.as_str(), k.flutes, k.tier, k.hold), (0, "6 mm", "6 mm", 0, 1, 0));
-        assert!(k.sketch != 0 && k.report.is_empty());
+        assert!(k.sketch != 0 && k.report.is_empty() && k.paths.is_empty() && k.pocket_sketch == 0);
 
         // Check lists the plan and changes nothing.
         let design = h.app.session.doc.to_json();
@@ -308,13 +427,19 @@ mod tests {
         let k = form(&h);
         assert!(!k.refused, "{:?}", k.report);
         assert!(k.report.iter().any(|l| l.contains("Outside finish") && l.contains("rpm")), "{:?}", k.report);
+        // The plan's paths are kept to draw: cuts and the moves between them, down to 0.2 mm
+        // under the plate.
+        assert!(k.paths.iter().any(|r| r.cutting) && k.paths.iter().any(|r| !r.cutting));
+        let low = k.paths.iter().flat_map(|r| &r.points).map(|p| p[2]).fold(f64::INFINITY, f64::min);
+        assert!((low + 6.2).abs() < 1e-6, "{low}");
+        assert!(k.paths.iter().map(|r| r.points.len()).sum::<usize>() > 100 && k.paths.iter().all(|r| !r.points.is_empty()));
         assert_eq!(h.app.session.doc.to_json(), design);
         // Without tabs the plan warns that the part comes loose; a changed value clears the last plan.
         if let Some(Kind::CutOut(k)) = h.app.dialog.as_mut().map(|d| &mut d.kind) {
             k.hold = 1;
         }
         h.frames(2);
-        assert!(form(&h).report.is_empty());
+        assert!(form(&h).report.is_empty() && form(&h).paths.is_empty());
         h.step(&json!({"click":{"handle":"dialog:cut_out:check"}})).unwrap();
         h.frames(2);
         assert!(form(&h).report.iter().any(|l| l.contains("nothing holds the part")), "{:?}", form(&h).report);
@@ -337,8 +462,39 @@ mod tests {
         let cam = &h.app.session.doc.cam;
         assert_eq!((cam.tools.len(), cam.setups.len(), cam.setups[0].operations.len()), (1, 1, 1));
 
+        // A second sketch gives pockets: its circle is cut 2 mm deep before everything else.
+        h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        h.app.run("sketch.circle.center", json!({"center": [10, 30], "radius": 5})).unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+        h.app.start("cam.cut_out");
+        h.frames(3);
+        let k = form(&h);
+        let (outline, recess) = (k.sketch, sketches(&h.app).last().unwrap().0);
+        assert!(outline != recess && k.pocket_sketch == 0, "the outline stays the part's sketch, not the newest: {k:?}");
+        if let Some(Kind::CutOut(k)) = h.app.dialog.as_mut().map(|d| &mut d.kind) {
+            k.pocket_sketch = recess;
+        }
+        h.frames(2);
+        h.step(&json!({"click":{"handle":"dialog:cut_out:check"}})).unwrap();
+        h.frames(2);
+        let k = form(&h);
+        assert!(!k.refused && k.report.iter().any(|l| l.contains("Pocket rough")), "{:?}", k.report);
+        let cut_out = k.report.iter().position(|l| l.contains("Pocket rough")).unwrap();
+        assert!(cut_out < k.report.iter().position(|l| l.contains("Opening 1 rough")).unwrap());
+        let dir = h.dir.clone();
+        h.app.services.pick_save =
+            Some(Box::new(move |_, _| Box::pin(std::future::ready(Some(dir.join("pocketed.nc").to_string_lossy().into_owned())))));
+        h.step(&json!({"click":{"handle":"dialog:Save G-code…"}})).unwrap();
+        wait_for_picker(&mut h);
+        assert!(std::fs::read_to_string(h.dir.join("pocketed.nc")).unwrap().contains("Pocket rough"));
+        h.app.start("cam.cut_out");
+        h.frames(3);
+        let k = form(&h);
+        assert_eq!((k.sketch, k.pocket_sketch, k.pocket_depth.as_str()), (outline, recess, "2 mm"));
+        h.step(&json!({"click":{"handle":"dialog:cancel"}})).unwrap();
+
         // Opened again, the dialog starts from that part's plate and cutter.
-        h.app.run("cam.cut_out", json!({"material": "acrylic", "thickness": "3 mm", "tool_diameter": 3.175, "flute_length": 12, "flutes": 2, "tier": "careful", "hold": "none"})).unwrap();
+        h.app.run("cam.cut_out", json!({"sketch": outline, "material": "acrylic", "thickness": "3 mm", "tool_diameter": 3.175, "flute_length": 12, "flutes": 2, "tier": "careful", "hold": "none"})).unwrap();
         h.app.start("cam.cut_out");
         h.frames(3);
         let k = form(&h);
