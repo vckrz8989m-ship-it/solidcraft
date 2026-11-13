@@ -135,7 +135,14 @@ pub fn current_version() -> &'static str {
 /// The release workflow built this binary (`SOLIDCRAFT_VERSION` is set there). Anything else is a
 /// development build, which never checks for updates.
 pub fn release_build() -> bool {
-    option_env!("SOLIDCRAFT_VERSION").is_some_and(|v| !v.is_empty()) && !cfg!(debug_assertions)
+    option_env!("SOLIDCRAFT_VERSION").is_some_and(|v| !v.is_empty() && !fork_build(v)) && !cfg!(debug_assertions)
+}
+
+/// A fork's own build (this fork's workflow names its versions `…-router.N`): the project's
+/// releases are not updates to it, so it never checks, as a development build never does.
+/// Updating one to a release would take away what the fork adds.
+fn fork_build(version: &str) -> bool {
+    version.contains("-router.")
 }
 
 // ---- installations ----------------------------------------------------------------------------
