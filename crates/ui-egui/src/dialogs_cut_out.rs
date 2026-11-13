@@ -222,27 +222,31 @@ fn number(v: &Value) -> String {
 }
 
 /// The lines that tell a plan: its size and time, each cut with its speed and feed, each issue.
+/// Short enough to stay a line each in the dialog's column, so a small window shows the plan.
 fn lines(reply: &Value) -> Vec<String> {
     let tr = solidcraft_ui_text::tr_label;
     let (lo, hi) = (&reply["extents"]["min"], &reply["extents"]["max"]);
     let mut out = vec![
         format!("{}: {} min", tr("Cutting time"), number(&reply["readback"]["cut_minutes"])),
-        format!(
-            "{}: X {} … {}, Y {} … {}, Z {} … {} mm",
-            tr("Tool travel from the work zero"),
-            number(&lo[0]),
-            number(&hi[0]),
-            number(&lo[1]),
-            number(&hi[1]),
-            number(&lo[2]),
-            number(&hi[2])
-        ),
+        format!("X {} … {}   Y {} … {} mm", number(&lo[0]), number(&hi[0]), number(&lo[1]), number(&hi[1])),
+        format!("Z {} … {} mm", number(&lo[2]), number(&hi[2])),
     ];
+    // A cut is named after its part (`Sketch1: Outside rough`): in the part's own dialog the
+    // cut's name alone says which it is.
+    let part = reply["operation"].as_str().map(|name| format!("{name}: ")).unwrap_or_default();
     for cut in reply["cuts"].as_array().into_iter().flatten() {
-        out.push(format!("{}: {} rpm, {} mm/min", cut["name"].as_str().unwrap_or_default(), number(&cut["rpm"]), number(&cut["feed"])));
+        let name = cut["name"].as_str().unwrap_or_default();
+        out.push(format!("{} · {} rpm · {} mm/min", name.strip_prefix(part.as_str()).unwrap_or(name), number(&cut["rpm"]), number(&cut["feed"])));
     }
     for issue in reply["issues"].as_array().into_iter().flatten() {
-        let at = issue["at"].as_str().map(|a| format!("{a}: ")).unwrap_or_default();
+        let at = match issue["at"].as_str() {
+            Some(a) => match a.strip_prefix(part.as_str()) {
+                Some(rest) => format!("{rest}: "),
+                None if format!("{a}: ") == part => String::new(),
+                None => format!("{a}: "),
+            },
+            None => String::new(),
+        };
         out.push(format!("{}: {at}{}", tr("Warning"), issue["message"].as_str().unwrap_or_default()));
     }
     out
