@@ -34,7 +34,7 @@ go from sketch to a posted file inside the app, pass the G-code checks and grblH
 ## Built so far
 
 - Windows pipeline: pushing the `router-cam` branch builds an installer and a portable zip as
-  one workflow artifact (builds 1 to 6 succeeded).
+  one workflow artifact (builds 1 to 7 succeeded).
 - Router layer in `crates/cam/src/router/`: the `grblhal` post, the `flexihal-router` machine
   profile, the feeds calculator, the program and text checks, and two planners:
   - `auto` plans a plate part: pockets to a depth, then every opening the cutter fits roughed
@@ -59,6 +59,10 @@ choice of side, no second side); what the tool cannot see from above is not cut;
 plunges straight down at a slow feed, so the roughing cutter must cut at its centre; the plan
 is made on the window thread, so the app waits while a large part is planned; the toolpaths
 follow a fine mesh of the body, not its exact surfaces.
+
+How far the 3D carving is tested: the planner, the command and the dialog pass their tests on
+a domed part (the dialog on the headless harness). It has not been run on a real screen, the
+G-code has not been simulated in ioSender, and nothing has been cut with it.
 
 Not built yet: drilling and helical bores as operations of their own, a finishing pass on
 pocket floors, a tool library with proven recipes, schemas for the CAM commands, carving a
