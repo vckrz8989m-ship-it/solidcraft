@@ -82,6 +82,14 @@ fn sketches(app: &SolveApp) -> Vec<(u64, String)> {
         .collect()
 }
 
+/// The sketch a part's outline is most likely in: the one whose closed shapes cover the most
+/// (a pocket's or a hole pattern's sketch lies inside the outline's), the newest of equals.
+fn largest_sketch(app: &SolveApp) -> u64 {
+    let state = app.session.model.state();
+    let covered = |id: u64| state.sketch(id).map_or(0.0, |s| s.profiles.iter().map(|p| p.area.abs()).filter(|a| a.is_finite()).sum::<f64>());
+    sketches(app).iter().rev().map(|s| (s.0, covered(s.0))).fold((0, -1.0), |best, next| if next.1 > best.1 { next } else { best }).0
+}
+
 fn mm(v: f64) -> String {
     format!("{} mm", (v * 1000.0).round() / 1000.0)
 }
@@ -90,9 +98,8 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
     if id != "cam.cut_out" {
         return None;
     }
-    let newest = sketches(app).last().map_or(0, |s| s.0);
     let mut k = CutOut {
-        sketch: newest,
+        sketch: largest_sketch(app),
         material: 0,
         thickness: "6 mm".into(),
         diameter: "6 mm".into(),
@@ -475,6 +482,18 @@ mod tests {
         let k = form(&h);
         let (outline, recess) = (k.sketch, sketches(&h.app).last().unwrap().0);
         assert!(outline != recess && k.pocket_sketch == 0, "the outline stays the part's sketch, not the newest: {k:?}");
+        // So does it in a design that has cut nothing out yet: the outline is the sketch that covers the most.
+        let mut fresh = crate::scenario::Harness::new();
+        fresh.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        fresh.app.run("sketch.circle.center", json!({"center": [10, 30], "radius": 5})).unwrap();
+        fresh.app.run("sketch.finish", json!({})).unwrap();
+        plate(&mut fresh);
+        fresh.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        fresh.app.run("sketch.circle.center", json!({"center": [50, 10], "radius": 4})).unwrap();
+        fresh.app.run("sketch.finish", json!({})).unwrap();
+        fresh.app.start("cam.cut_out");
+        fresh.frames(3);
+        assert_eq!(form(&fresh).sketch, sketches(&fresh.app)[1].0, "the plate's sketch, drawn second of three");
         if let Some(Kind::CutOut(k)) = h.app.dialog.as_mut().map(|d| &mut d.kind) {
             k.pocket_sketch = recess;
         }
