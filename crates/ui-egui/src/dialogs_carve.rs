@@ -374,6 +374,8 @@ mod tests {
         if let Some(Kind::Carve(k)) = h.app.dialog.as_mut().map(|d| &mut d.kind) {
             k.finisher = 2;
         }
+        // The finishing cutter's rows go, so the buttons move: a frame lays them out again.
+        h.frames(2);
         let dir = h.dir.clone();
         h.app.services.pick_save = Some(Box::new(move |_, _| Box::pin(std::future::ready(Some(dir.join("one.nc").to_string_lossy().into_owned())))));
         h.step(&json!({"click":{"handle":"dialog:Save G-code…"}})).unwrap();
