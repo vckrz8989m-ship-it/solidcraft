@@ -3,8 +3,11 @@
 //! may give pockets: its closed shapes are cut to a depth before the openings. Check plans the
 //! cuts on a copy of the design, lists them with what the plan warns of and draws their paths
 //! over the part ([`show`]): cuts in the accent colour, moves between them faintly. Nothing is
-//! written or kept until Save G-code. The values start from the part the design last cut out.
+//! written or kept until Save G-code. The values start from the part the design last cut out,
+//! else from the last program saved in any design; the cutters used before are offered by name
+//! (`6 mm · 1F · 18 mm`: diameter, flutes, flute length), kept in the preferences ([`Memory`]).
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use solidcraft_engine::doc::FeatureKind;
 use solidcraft_engine::doc::cam::CamOperation;
@@ -36,6 +39,59 @@ const SETUP: &str = "Router";
 /// Most points of a plan's paths drawn in a frame: past it, every few are.
 const MAX_DRAWN: usize = 60_000;
 
+/// Most cutters remembered.
+const MAX_CUTTERS: usize = 12;
+
+/// A cutter as the dialog's fields hold it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Cutter {
+    pub diameter: String,
+    /// Number of flutes, 1 to 4.
+    pub flutes: usize,
+    pub flute_length: String,
+}
+
+impl Cutter {
+    /// `6 mm · 1F · 18 mm`: diameter, flutes, flute length.
+    fn label(&self) -> String {
+        format!("{} · {}F · {}", self.diameter.trim(), self.flutes, self.flute_length.trim())
+    }
+
+    fn same(&self, other: &Cutter) -> bool {
+        self.diameter.trim() == other.diameter.trim() && self.flutes == other.flutes && self.flute_length.trim() == other.flute_length.trim()
+    }
+}
+
+/// What the dialog remembers between designs (the `cut_out_memory` preference): the cutters
+/// used, newest first, and the last program's plate and choices.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Memory {
+    #[serde(default)]
+    pub cutters: Vec<Cutter>,
+    #[serde(default)]
+    pub material: String,
+    #[serde(default)]
+    pub thickness: String,
+    #[serde(default)]
+    pub tier: String,
+    #[serde(default)]
+    pub hold: String,
+    #[serde(default)]
+    pub pocket_depth: String,
+}
+
+impl Memory {
+    /// What the preference holds; a text that is not a memory is none.
+    fn read(text: &str) -> Memory {
+        let mut memory: Memory = serde_json::from_str(text).unwrap_or_default();
+        memory.cutters.retain(|c| {
+            (1..=FLUTES.len()).contains(&c.flutes) && !c.diameter.trim().is_empty() && c.diameter.len() <= 64 && c.flute_length.len() <= 64
+        });
+        memory.cutters.truncate(MAX_CUTTERS);
+        memory
+    }
+}
+
 /// A run of a planned path in the model: a cut, or the move to the next one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Run {
@@ -59,6 +115,10 @@ pub struct CutOut {
     pub tier: usize,
     /// Index into [`HOLDS`].
     pub hold: usize,
+    /// The cutters offered by name: those remembered, then the design's own.
+    pub cutters: Vec<Cutter>,
+    /// The cutter chosen among them; past their end, a new one typed in the fields.
+    pub cutter: usize,
     /// The sketch whose closed shapes are pockets (a feature id; 0: none).
     pub pocket_sketch: u64,
     pub pocket_depth: String,
@@ -107,6 +167,8 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         flute_length: "18 mm".into(),
         tier: 1,
         hold: 0,
+        cutters: Vec::new(),
+        cutter: 0,
         pocket_sketch: 0,
         pocket_depth: "2 mm".into(),
         paths: Vec::new(),
@@ -114,6 +176,27 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         refused: false,
         report_of: String::new(),
     };
+    // The last program saved in any design gives the plate, the choices and the cutters known.
+    let memory = Memory::read(&app.preferences.cut_out_memory);
+    k.material = MATERIALS.iter().position(|m| m.0 == memory.material).unwrap_or(k.material);
+    k.tier = TIERS.iter().position(|t| t.0 == memory.tier).unwrap_or(k.tier);
+    k.hold = HOLDS.iter().position(|h| h.0 == memory.hold).unwrap_or(k.hold);
+    if !memory.thickness.trim().is_empty() {
+        k.thickness = memory.thickness.clone();
+    }
+    if !memory.pocket_depth.trim().is_empty() {
+        k.pocket_depth = memory.pocket_depth.clone();
+    }
+    k.cutters = memory.cutters;
+    for t in &app.session.doc.cam.tools {
+        let cutter = Cutter { diameter: mm(t.diameter), flutes: t.flutes as usize, flute_length: mm(t.flute_length) };
+        if (1..=FLUTES.len()).contains(&cutter.flutes) && !k.cutters.iter().any(|c| c.same(&cutter)) && k.cutters.len() < 2 * MAX_CUTTERS {
+            k.cutters.push(cutter);
+        }
+    }
+    if let Some(first) = k.cutters.first() {
+        (k.diameter, k.flutes, k.flute_length) = (first.diameter.clone(), first.flutes - 1, first.flute_length.clone());
+    }
     // The part cut out last gives the plate, the cutter and, while they are still there, its sketches.
     let cam = &app.session.doc.cam;
     let last = cam.setup(SETUP).and_then(|s| s.operations.iter().rev().find(|op| matches!(op, CamOperation::Part { .. })));
@@ -141,7 +224,25 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
             k.flutes = FLUTES.iter().position(|f| f.parse::<u32>().is_ok_and(|n| n == t.flutes)).unwrap_or(k.flutes);
         }
     }
+    // The cutter in the fields is chosen by name where it is one of those offered.
+    let typed = Cutter { diameter: k.diameter.clone(), flutes: k.flutes + 1, flute_length: k.flute_length.clone() };
+    k.cutter = k.cutters.iter().position(|c| c.same(&typed)).unwrap_or(k.cutters.len());
     Some((Kind::CutOut(k), Vec::new()))
+}
+
+/// The memory with this program's cutter first and its plate and choices as the last.
+fn remembered(old: &str, k: &CutOut) -> String {
+    let mut memory = Memory::read(old);
+    let cutter = Cutter { diameter: k.diameter.trim().to_owned(), flutes: k.flutes + 1, flute_length: k.flute_length.trim().to_owned() };
+    memory.cutters.retain(|c| !c.same(&cutter));
+    memory.cutters.insert(0, cutter);
+    memory.cutters.truncate(MAX_CUTTERS);
+    memory.material = MATERIALS.get(k.material).map_or("", |m| m.0).to_owned();
+    memory.tier = TIERS.get(k.tier).map_or("", |t| t.0).to_owned();
+    memory.hold = HOLDS.get(k.hold).map_or("", |h| h.0).to_owned();
+    memory.thickness = k.thickness.trim().to_owned();
+    memory.pocket_depth = k.pocket_depth.trim().to_owned();
+    serde_json::to_string(&memory).unwrap_or_default()
 }
 
 /// What `cam.cut_out` is asked.
@@ -323,9 +424,24 @@ pub fn rows(app: &SolveApp, ui: &mut egui::Ui, k: &mut CutOut) -> bool {
         combo(ui, "cut_out_material", &labels, &mut k.material);
     });
     form_row(ui, "Plate thickness", |ui| enter |= field(ui, &mut k.thickness));
-    form_row(ui, "Cutter diameter", |ui| enter |= field(ui, &mut k.diameter));
-    form_row(ui, "Flutes", |ui| combo(ui, "cut_out_flutes", &FLUTES, &mut k.flutes));
-    form_row(ui, "Flute length", |ui| enter |= field(ui, &mut k.flute_length));
+    // A cutter used before is chosen by name; the last row is a new one, typed below.
+    if !k.cutters.is_empty() {
+        form_row(ui, "Cutter", |ui| {
+            let names: Vec<String> = k.cutters.iter().map(Cutter::label).collect();
+            let labels: Vec<&str> = names.iter().map(String::as_str).chain([tr("New cutter…")]).collect();
+            let mut at = k.cutter.min(k.cutters.len());
+            combo(ui, "cut_out_cutter", &labels, &mut at);
+            k.cutter = at;
+        });
+        if let Some(c) = k.cutters.get(k.cutter) {
+            (k.diameter, k.flutes, k.flute_length) = (c.diameter.clone(), c.flutes.saturating_sub(1).min(FLUTES.len() - 1), c.flute_length.clone());
+        }
+    }
+    if k.cutter >= k.cutters.len() {
+        form_row(ui, "Cutter diameter", |ui| enter |= field(ui, &mut k.diameter));
+        form_row(ui, "Flutes", |ui| combo(ui, "cut_out_flutes", &FLUTES, &mut k.flutes));
+        form_row(ui, "Flute length", |ui| enter |= field(ui, &mut k.flute_length));
+    }
     form_row(ui, "How hard to cut", |ui| {
         let labels: Vec<&str> = TIERS.iter().map(|t| tr(t.1)).collect();
         combo(ui, "cut_out_tier", &labels, &mut k.tier);
@@ -365,6 +481,7 @@ pub fn run(app: &mut SolveApp, k: &CutOut) -> Result<(), String> {
     let mut dry = asked.clone();
     dry["dry_run"] = json!(true);
     app.session.preview(&[("cam.cut_out".to_string(), dry)]).map_err(|e| e.to_string())?;
+    app.preferences.cut_out_memory = remembered(&app.preferences.cut_out_memory, k);
     let name = sketches(app).into_iter().find(|s| s.0 == k.sketch).map_or_else(|| app.session.doc.name.clone(), |s| s.1);
     app.pick_save(&format!("{name}.nc"), &["nc"], move |app, path| {
         let Some(path) = path else { return };
@@ -429,6 +546,7 @@ mod tests {
         h.frames(3);
         let k = form(&h);
         assert_eq!((k.material, k.thickness.as_str(), k.diameter.as_str(), k.flutes, k.tier, k.hold), (0, "6 mm", "6 mm", 0, 1, 0));
+        assert!(k.cutters.is_empty() && k.cutter == 0, "no cutter is known yet: the fields are typed");
         assert!(k.sketch != 0 && k.report.is_empty() && k.paths.is_empty() && k.pocket_sketch == 0);
         // No field takes the keyboard as it opens (see `dialogs_dense::rows`).
         assert!(h.ctx.memory(|m| m.focused()).is_none(), "a field has the keyboard");
@@ -517,6 +635,35 @@ mod tests {
         let k = form(&h);
         assert_eq!((k.sketch, k.pocket_sketch, k.pocket_depth.as_str()), (outline, recess, "2 mm"));
         h.step(&json!({"click":{"handle":"dialog:cancel"}})).unwrap();
+
+        // The program saved is remembered for other designs: its cutter by name, its plate and choices.
+        let memory = Memory::read(&h.app.preferences.cut_out_memory);
+        assert_eq!(memory.cutters, [Cutter { diameter: "6 mm".into(), flutes: 1, flute_length: "18 mm".into() }]);
+        assert_eq!((memory.material.as_str(), memory.thickness.as_str(), memory.hold.as_str()), ("aluminum", "6 mm", "tabs"));
+        let mut other = crate::scenario::Harness::new();
+        other.app.load_prefs(&h.app.prefs());
+        other.app.preferences.cut_out_memory = remembered(
+            &other.app.preferences.cut_out_memory,
+            &CutOut { diameter: "3.175 mm".into(), flutes: 1, flute_length: "12 mm".into(), thickness: "3 mm".into(), material: 3, ..k.clone() },
+        );
+        plate(&mut other);
+        other.app.start("cam.cut_out");
+        other.frames(3);
+        let k = form(&other);
+        assert_eq!(k.cutters.iter().map(Cutter::label).collect::<Vec<_>>(), ["3.175 mm · 2F · 12 mm", "6 mm · 1F · 18 mm"]);
+        assert_eq!((k.cutter, k.diameter.as_str(), k.flutes, k.flute_length.as_str()), (0, "3.175 mm", 1, "12 mm"));
+        assert_eq!((k.material, k.thickness.as_str()), (3, "3 mm"));
+        // The older cutter chosen by name fills the fields the program is asked with.
+        if let Some(Kind::CutOut(k)) = other.app.dialog.as_mut().map(|d| &mut d.kind) {
+            k.cutter = 1;
+        }
+        other.frames(2);
+        let k = form(&other);
+        assert_eq!((k.diameter.as_str(), k.flutes, k.flute_length.as_str()), ("6 mm", 0, "18 mm"));
+        assert!(
+            Memory::read("not a memory").cutters.is_empty()
+                && Memory::read(r#"{"cutters":[{"diameter":"","flutes":9,"flute_length":""}]}"#).cutters.is_empty()
+        );
 
         // Opened again, the dialog starts from that part's plate and cutter.
         h.app.run("cam.cut_out", json!({"sketch": outline, "material": "acrylic", "thickness": "3 mm", "tool_diameter": 3.175, "flute_length": 12, "flutes": 2, "tier": "careful", "hold": "none"})).unwrap();

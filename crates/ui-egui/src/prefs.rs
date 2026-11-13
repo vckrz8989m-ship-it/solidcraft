@@ -1476,6 +1476,9 @@ preference_settings! {
     /// choice here (`save_mesh_send`, `save_mesh_slicer`); a settings file that still has them loads,
     /// and they are ignored.
     save_mesh_format: String = "stl".into();
+    /// Cut Out Part: the cutters used before and the plate and choices of the last program saved
+    /// (JSON, `dialogs_cut_out::Memory`), so a new design starts from them. Empty: none yet.
+    cut_out_memory: String = String::new();
     /// Hidden edges in the current-view DXF export (false: omit, true: dashed).
     view_dxf_dashed: bool = false;
     /// Model-space chord tolerance for current-view DXF curves, in millimetres.

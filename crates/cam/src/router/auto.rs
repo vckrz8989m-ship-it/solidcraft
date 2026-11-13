@@ -18,22 +18,28 @@
 //! A region lying in an opening of another is the material that opening removes, not a part
 //! of its own (a sketch of a plate with a hole gives both the plate and the hole's disc).
 //!
+//! A round opening the cutter does not fit is not cut, but its centre is marked: a shallow
+//! plunge ([`MARK_DEPTH`]) for a drill to start in once the part is off the machine.
+//!
 //! What cannot be cut as asked is said, not guessed: an opening the cutter does not fit is
 //! left alone and reported, and so are flutes shorter than the plate is thick.
 
 use serde::{Deserialize, Serialize};
-use solidcore_record::{Loop2, Region2, Seg2, Vec2};
+use solidcore_record::{Loop2, Region2, Seg2, Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
 use crate::router::feeds::{CutKind, FeedRequest, Material, Recipe, Tier, recipe};
 use crate::router::{Issue, MachineProfile};
 use crate::{
-    CamError, ContourOptions, ContourParams, Cut, Feeds, Heights, Operation, PocketParams, Result, Side, TabLayout, Tabs, Tool, contour,
-    contour_with, invalid, offset_regions, pocket, verify,
+    CamError, ContourOptions, ContourParams, Cut, Feeds, Heights, Move, Operation, PocketParams, Result, Side, TabLayout, Tabs, Tool, Toolpath,
+    contour, contour_with, invalid, offset_regions, pocket, verify,
 };
 
 /// The most regions and openings one part may have.
 const MAX_LOOPS: usize = 2000;
+/// How deep the centre of a round opening too small for the cutter is marked (mm), and never
+/// more than half the plate.
+pub const MARK_DEPTH: f64 = 0.5;
 /// Chord error allowed on curved boundaries (mm).
 const TOLERANCE: f64 = 0.005;
 
@@ -140,6 +146,14 @@ fn middle(lp: &Loop2) -> Vec2 {
     let n = lp.segs.len().max(1) as f64;
     let sum = lp.segs.iter().map(Seg2::start).fold(Vec2 { x: 0.0, y: 0.0 }, |a, p| Vec2 { x: a.x + p.x, y: a.y + p.y });
     Vec2 { x: sum.x / n, y: sum.y / n }
+}
+
+/// The centre and radius of a loop that is one full circle.
+fn full_circle(lp: &Loop2) -> Option<(Vec2, f64)> {
+    match lp.segs.as_slice() {
+        [Seg2::Arc { center, radius, sweep, .. }] if (sweep.abs() - std::f64::consts::TAU).abs() < 1e-9 => Some((*center, *radius)),
+        _ => None,
+    }
 }
 
 /// The tabs an outline is left on: one about every 100 mm, three to eight, as long as the
@@ -300,6 +314,29 @@ pub fn plan_part_with(regions: &[Region2], pockets: &[Pocket], tool: &Tool, cut:
     for Recess { name, region, depth, kind } in recesses {
         let one = std::slice::from_ref(&region);
         if offset_regions(one, d / 2.0, TOLERANCE)?.is_empty() {
+            // A round opening is marked at its centre for a drill; anything else is left alone.
+            if let (true, Some((centre, across))) = (depth >= total, full_circle(&region.outer)) {
+                let mark = MARK_DEPTH.min(0.5 * cut.thickness);
+                let h = levels(mark);
+                let at = |z: f64| Vec3::new(centre.x, centre.y, z);
+                let path = Toolpath {
+                    moves: vec![
+                        Move::Rapid { to: at(h.clearance) },
+                        Move::Rapid { to: at(h.retract) },
+                        Move::Feed { to: at(h.bottom), feed: 0.5 * slot.ramp_feed },
+                        Move::Rapid { to: at(h.clearance) },
+                    ],
+                };
+                plan.issues.push(Issue::warning(
+                    Some(name.clone()),
+                    format!(
+                        "the {d:.3} mm cutter does not fit this {:.3} mm hole: its centre is marked {mark:.1} mm deep, to drill it afterwards",
+                        2.0 * across
+                    ),
+                ));
+                add(&mut plan, format!("{name} mark"), slot.rpm, path, mark)?;
+                continue;
+            }
             plan.issues.push(Issue::warning(
                 Some(name),
                 format!("the {d:.3} mm cutter does not fit this {kind}: it is left uncut, for a smaller cutter or a drill"),
