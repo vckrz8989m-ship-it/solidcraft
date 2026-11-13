@@ -53,7 +53,7 @@ pub struct Cutter {
 
 impl Cutter {
     /// `6 mm · 1F · 18 mm`: diameter, flutes, flute length.
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         format!("{} · {}F · {}", self.diameter.trim(), self.flutes, self.flute_length.trim())
     }
 
@@ -82,7 +82,7 @@ pub struct Memory {
 
 impl Memory {
     /// What the preference holds; a text that is not a memory is none.
-    fn read(text: &str) -> Memory {
+    pub fn read(text: &str) -> Memory {
         let mut memory: Memory = serde_json::from_str(text).unwrap_or_default();
         memory.cutters.retain(|c| {
             (1..=FLUTES.len()).contains(&c.flutes) && !c.diameter.trim().is_empty() && c.diameter.len() <= 64 && c.flute_length.len() <= 64
@@ -231,7 +231,7 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
 }
 
 /// The memory with this program's cutter first and its plate and choices as the last.
-fn remembered(old: &str, k: &CutOut) -> String {
+pub fn remembered(old: &str, k: &CutOut) -> String {
     let mut memory = Memory::read(old);
     let cutter = Cutter { diameter: k.diameter.trim().to_owned(), flutes: k.flutes + 1, flute_length: k.flute_length.trim().to_owned() };
     memory.cutters.retain(|c| !c.same(&cutter));

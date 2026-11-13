@@ -427,11 +427,38 @@ fn openings_are_cut_nearest_first_and_only_where_the_cutter_fits() {
     let part = plate_with(&[(50.0, 30.0, 5.0), (10.0, 10.0, 5.0), (30.0, 30.0, 2.5), (30.0, 10.0, 3.1)]);
     let plan = plan_part(&part, &tool, &cut, &m).unwrap();
     let names: Vec<&str> = plan.operations.iter().map(|o| o.name.as_str()).collect();
-    assert_eq!(names, ["Opening 2 rough", "Opening 2 finish", "Opening 4", "Opening 1 rough", "Opening 1 finish", "Outside rough", "Outside finish"]);
+    // The round opening the cutter does not fit is marked at its centre in its turn, for a drill.
+    assert_eq!(
+        names,
+        [
+            "Opening 2 rough",
+            "Opening 2 finish",
+            "Opening 4",
+            "Opening 3 mark",
+            "Opening 1 rough",
+            "Opening 1 finish",
+            "Outside rough",
+            "Outside finish"
+        ]
+    );
     let unfit: Vec<_> = plan.issues.iter().filter(|i| i.message.contains("does not fit")).collect();
     assert_eq!(unfit.len(), 1, "{:?}", plan.issues);
     assert_eq!(unfit[0].at.as_deref(), Some("Opening 3"));
     assert_eq!(unfit[0].severity, Severity::Warning);
+    assert!(unfit[0].message.contains("5.000 mm hole") && unfit[0].message.contains("marked 0.5 mm deep"), "{}", unfit[0].message);
+    let mark = &plan.operations[3];
+    let cut_points: Vec<Vec3> = mark.path.points(0.01).into_iter().filter(|(_, c)| *c).map(|(p, _)| p).collect();
+    assert_eq!(cut_points.len(), 1, "one plunge: {cut_points:?}");
+    close(cut_points[0].x, 30.0, 1e-9);
+    close(cut_points[0].y, 30.0, 1e-9);
+    close(cut_points[0].z, -0.5, 1e-9);
+    // An opening that is not round, and too narrow, is left alone and said so.
+    let mut slotted = plate_with(&[]);
+    slotted[0].holes.push(Loop2::polygon(&[v(20.0, 10.0), v(40.0, 10.0), v(40.0, 14.0), v(20.0, 14.0)]).reversed());
+    let narrow = plan_part(&slotted, &tool, &cut, &m).unwrap();
+    let cut_names: Vec<&str> = narrow.operations.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(cut_names, ["Outside rough", "Outside finish"]);
+    assert!(narrow.issues.iter().any(|i| i.message.contains("left uncut")), "{:?}", narrow.issues);
 
     // A plate thicker than the flutes is an error to read, and nothing is cut.
     let thick = plan_part(&plate_with(&[]), &tool, &PartCut::new(Material::Aluminum, 20.0), &m).unwrap();
@@ -526,6 +553,7 @@ fn pockets_are_cut_to_their_depth_before_the_openings_and_round_their_islands() 
     let names: Vec<&str> = plan.operations.iter().map(|o| o.name.as_str()).collect();
     assert_eq!(names[..4], ["Pocket 2 rough", "Pocket 2 finish", "Pocket 1 rough", "Pocket 1 finish"]);
     assert!(plan.issues.iter().any(|i| i.at.as_deref() == Some("Pocket 3") && i.message.contains("does not fit this pocket")), "{:?}", plan.issues);
+    assert!(names.iter().all(|n| !n.contains("mark")), "a pocket too small for the cutter is not marked: {names:?}");
 
     // A pocket as deep as the plate is an opening drawn in the wrong sketch: an error, nothing cut.
     let through = plan_part_with(&plate_with(&[]), &[Pocket { regions: vec![disc(30.0, 20.0, 8.0)], depth: 6.0 }], &tool, &cut, &m).unwrap();

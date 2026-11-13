@@ -1568,6 +1568,26 @@ mod tests {
         assert_eq!(by_number["tool"]["number"].as_u64(), Some(1));
         assert_eq!((s.doc.cam.tools.len(), s.doc.cam.setups[0].operations.len()), (2, 2));
 
+        // A round hole the cutter does not fit is marked at its centre for a drill, and said.
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [100, 0], "p1": [140, 30]}));
+        run(&mut s, "sketch.circle.center", json!({"center": [120, 15], "radius": 2}));
+        let bracket = s.active_sketch.expect("sketch");
+        run(&mut s, "sketch.finish", json!({}));
+        let marked = run(
+            &mut s,
+            "cam.cut_out",
+            json!({"sketch": bracket, "material": "aluminum", "thickness": 6, "tool": 1, "name": "Bracket", "dry_run": true}),
+        );
+        let names: Vec<&str> = marked["cuts"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+        assert_eq!(names, ["Bracket: Opening 1 mark", "Bracket: Outside rough", "Bracket: Outside finish"]);
+        assert!(marked["gcode"].as_str().unwrap().contains("X120 Y15") && marked["gcode"].as_str().unwrap().contains("Z-0.5"), "{}", marked["gcode"]);
+        assert!(
+            marked["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("4.000 mm hole"))),
+            "{}",
+            marked["issues"]
+        );
+
         // One step to undo, and a refusal leaves the design as it was.
         let before = s.doc.cam.clone();
         for (params, why) in [
