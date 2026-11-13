@@ -33,20 +33,36 @@ go from sketch to a posted file inside the app, pass the G-code checks and grblH
 
 ## Built so far
 
-- Windows pipeline: build 1 of `router-windows.yml` succeeded (1 h 21 min, installer and
-  portable zip as one workflow artifact).
+- Windows pipeline: pushing the `router-cam` branch builds an installer and a portable zip as
+  one workflow artifact (builds 1 to 6 succeeded).
 - Router layer in `crates/cam/src/router/`: the `grblhal` post, the `flexihal-router` machine
-  profile, the feeds calculator, the program and text checks, and `auto`, which plans a part's
-  cuts: every opening the cutter fits is roughed and finished, nearest first, then the outside.
+  profile, the feeds calculator, the program and text checks, and two planners:
+  - `auto` plans a plate part: pockets to a depth, then every opening the cutter fits roughed
+    and finished, nearest first, then the outside with holding tabs. A round opening too small
+    for the cutter gets a centre mark to drill afterwards.
+  - `solid` plans a solid part carved from a block: roughing level by level with a flat end
+    mill, the walls level by level with the same cutter, then finishing passes side by side
+    with a ball end mill (or the roughing cutter). The part stays on a skin of the block.
 - Commands: upstream's `cam.*` commands ported onto the current library, plus `cam.feeds`,
-  `cam.op.part` (a whole part as one saved operation, planned again at every post) and
-  `cam.cut_out` (sketch to checked G-code file in one step, with a dry run). `cam.post` takes a
-  machine and writes a file.
-- App: File > "Cut Out Part to G-code…" opens a dialog (sketch, material, thickness, cutter,
-  how hard to cut) with a Check button and Save G-code.
+  `cam.op.part` (a whole plate part as one saved operation, planned again at every post),
+  `cam.cut_out` (sketch to checked G-code file in one step, with a dry run and the paths to
+  draw) and `cam.carve` (solid body to one checked G-code file a cutter; nothing is kept in
+  the design). `cam.post` takes a machine and writes a file.
+- App: File > "Cut Out Part to G-code…" (outline sketch, pocket sketch and depth, material,
+  thickness, cutter chosen from those used before, how hard to cut, hold-down) and File >
+  "Carve Solid to G-code…" (body, material, roughing and finishing cutters, stock above and
+  skin under the part). Both have a Check button that lists the plan and draws its paths over
+  the part, and Save G-code.
 
-Not built yet: holding tabs, drilling and helical bores as operations of their own, a toolpath
-preview in the viewport, a tool library with proven recipes, schemas for the CAM commands.
+Limits of the 3D carving as built: the body is cut from above as it lies in the model (no
+choice of side, no second side); what the tool cannot see from above is not cut; roughing
+plunges straight down at a slow feed, so the roughing cutter must cut at its centre; the plan
+is made on the window thread, so the app waits while a large part is planned; the toolpaths
+follow a fine mesh of the body, not its exact surfaces.
+
+Not built yet: drilling and helical bores as operations of their own, a finishing pass on
+pocket floors, a tool library with proven recipes, schemas for the CAM commands, carving a
+second side.
 
 ## Scope
 
@@ -57,7 +73,7 @@ In version 1:
 - A grblHAL/Flexi-HAL post, one file per tool by default.
 - Checks before a file is written, and a Manufacture panel in the app.
 
-Not in version 1: built-in sender, 3D surfacing, 4th axis, engraving text, adaptive clearing
+Not in version 1: built-in sender, 4th axis, engraving text, adaptive clearing
 as the default (the upstream code exists and can be switched on later), nesting, and VFD or
 controller configuration.
 
