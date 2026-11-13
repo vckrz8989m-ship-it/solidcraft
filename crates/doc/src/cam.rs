@@ -313,7 +313,7 @@ impl CamStock {
     }
 
     pub fn validate(&self) -> Result<()> {
-        let ok = |n: f64| n.is_finite() && n >= 0.0 && n <= 1.0e6;
+        let ok = |n: f64| (0.0..=1.0e6).contains(&n);
         match self {
             CamStock::Box { width, depth, height } if ok(*width) && *width > 0.0 && ok(*depth) && *depth > 0.0 && ok(*height) && *height > 0.0 => {
                 Ok(())
@@ -865,10 +865,10 @@ impl CamOperation {
 }
 
 fn check_spindle(spindle: Option<f64>) -> Result<()> {
-    if let Some(rpm) = spindle {
-        if !(rpm > 0.0) || !rpm.is_finite() || rpm > 1.0e6 {
-            return Err(DocError::Invalid("spindle_rpm must be above 0".into()));
-        }
+    if let Some(rpm) = spindle
+        && (!(rpm > 0.0) || !rpm.is_finite() || rpm > 1.0e6)
+    {
+        return Err(DocError::Invalid("spindle_rpm must be above 0".into()));
     }
     Ok(())
 }
