@@ -7,9 +7,11 @@ use serde_json::{Value, json};
 use solidcore_record::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
 use solidcraft_cam::router::auto::{PartCut, Planned, Pocket, plan_part_with};
 use solidcraft_cam::router::feeds::{CutKind, FeedRequest, Material, Tier, recipe};
+use solidcraft_cam::router::solid::{SolidCut, block, plan_solid};
 use solidcraft_cam::router::{Issue, MachineProfile, Severity, check_program, check_text, check_travel};
 use solidcraft_cam::{
-    ContourParams, Cut, Feeds, Heights, Move, Operation, PocketParams, Post, Program, Side, Tool, ToolKind, contour, emit, pocket, readback,
+    ContourParams, Cut, Feeds, Frame, Heights, Move, Operation, PocketParams, Post, Program, Side, Surface, Tool, ToolKind, contour, emit, pocket,
+    readback,
 };
 use solidcraft_doc::cam::{
     CamContourParams, CamCut, CamFaceRef, CamGeometry, CamOperation, CamPartPocket, CamPocketParams, CamSettings, CamSetup, CamSide, MAX_OPS,
@@ -73,6 +75,25 @@ pub static COMMANDS: &[CommandSpec] = &[
          paths?: bool (also reply paths: [{name, points: [[x, y, z, cutting 1|0]]}] in model coordinates, to draw) → \
          {setup, operation, tool, cuts: [{name, rpm, feed}] in cutting order, issues, extents, gcode, readback, path?}. One step from a drawn outline to a \
          checked program of that part alone: the part is kept in the setup as cam.op.part would keep it.",
+    ),
+    CommandSpec::new("cam.carve", "Carve Solid to G-code", carve_cmd).icon("cut").noundo().params(
+        "body?: name (default the design's only body); \
+         material: aluminum|aluminum_soft|brass|acrylic|soft_plastic|hardwood|softwood; \
+         tool_diameter, with flutes? (default 1) and flute_length? (default 3 diameters): the flat end mill that roughs and cuts the walls; \
+         finish_diameter?, with finish_kind?: ball|flat (default ball), finish_flutes? (default 2) and finish_flute_length? \
+         (default 3 diameters): the cutter of the finishing passes (left out, the roughing cutter makes them); \
+         tier?: careful|standard|bold; margin? (the roughing cutter's centre goes this far beyond the part, default 6 mm); \
+         stock_top? (stock above the part's highest point, default 0.5 mm); finish_stock? (default 0.3 mm); \
+         skin? (left under the part so it stays on the block, default 0.5 mm; 0 cuts it free); \
+         finish_stepover? (default a tenth of a ball end mill's diameter, a third of a flat one's); coolant?: bool (default true); \
+         machine?: (default flexihal-router); path?: file the G-code is written to (with two cutters one file each, \
+         `-1-rough` and `-2-finish` put before the extension); dry_run?: bool (plan and check only: nothing is written); \
+         paths?: bool (also reply paths: [{name, points: [[x, y, z, cutting 1|0]]}] in model coordinates, to draw) → \
+         {body, block: {min, max} (model coordinates; the stock must be at least this large), zero: [x, y, z] (the work zero in \
+         the model: the block's low X, low Y corner on its top), programs: [{name, tool, cuts: [{name, rpm, feed}], gcode, \
+         readback, extents, issues, path?}] one a cutter, in cutting order, issues}. The body is carved from above \
+         (the model's +Z) as it lies: roughing level by level, the walls, then finishing passes side by side. What the \
+         tool cannot see from above is not cut. Nothing is kept in the design.",
     ),
     CommandSpec::new("cam.op.remove", "Remove CAM Operation", delete_op).icon("delete").params("setup; name"),
     CommandSpec::new("cam.post", "Post Process", post_cmd).icon("export").noundo().params(
@@ -885,6 +906,166 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// A cutter of `kind` from `{prefix}diameter`, `{prefix}flutes` and `{prefix}flute_length`
+/// (`flutes` and `flute_length` alone for the prefix `tool_`); `None` when no diameter is given.
+fn cutter_param(s: &Session, cmd: &str, p: &Value, prefix: &str, number: u32, kind: ToolKind, flutes: u32) -> Result<Option<Tool>> {
+    let key = |k: &str| if prefix == "tool_" && k != "diameter" { k.to_string() } else { format!("{prefix}{k}") };
+    let Some(d) = length_param(s, cmd, p, &key("diameter"))? else { return Ok(None) };
+    let fk = key("flutes");
+    let flutes = match p.get(&fk) {
+        None | Some(Value::Null) => flutes,
+        Some(_) => num(p, &fk)
+            .filter(|n| *n >= 1.0 && *n <= 100.0 && n.fract() == 0.0)
+            .map(|n| n as u32)
+            .ok_or_else(|| bad(cmd, format!("`{fk}` must be a whole number 1…100")))?,
+    };
+    let mut tool = Tool::new(number, kind, d, length_param(s, cmd, p, &key("flute_length"))?.unwrap_or(3.0 * d));
+    tool.flutes = flutes;
+    let shape = if kind == ToolKind::BallEndmill { "ball" } else { "flat" };
+    tool.description = format!("{d} mm {shape} end mill, {flutes} flute{}", if flutes == 1 { "" } else { "s" });
+    tool.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    Ok(Some(tool))
+}
+
+/// `path` with `tag` put before its extension: `part.nc` and `-1-rough` give `part-1-rough.nc`.
+fn tagged_path(path: &str, tag: &str) -> String {
+    let p = std::path::Path::new(path);
+    match (p.file_stem().and_then(|s| s.to_str()), p.extension().and_then(|e| e.to_str())) {
+        (Some(stem), Some(ext)) => p.with_file_name(format!("{stem}{tag}.{ext}")).to_string_lossy().into_owned(),
+        _ => format!("{path}{tag}"),
+    }
+}
+
+fn carve_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.carve";
+    let machine = machine_named(cmd, str_(p, "machine").unwrap_or(DEFAULT_MACHINE))?;
+    let dry_run = bool_(p, "dry_run").unwrap_or(false);
+    let with_paths = bool_(p, "paths").unwrap_or(false);
+    let material: Material = word(cmd, p, "material", "aluminum, aluminum_soft, brass, acrylic, soft_plastic, hardwood or softwood")?
+        .ok_or_else(|| bad(cmd, "`material` is required: aluminum, aluminum_soft, brass, acrylic, soft_plastic, hardwood or softwood"))?;
+    let rough = cutter_param(s, cmd, p, "tool_", 1, ToolKind::FlatEndmill, 1)?
+        .ok_or_else(|| bad(cmd, "`tool_diameter` is required: the roughing cutter's"))?;
+    let finish_kind = match str_(p, "finish_kind") {
+        None | Some("ball") => ToolKind::BallEndmill,
+        Some("flat") => ToolKind::FlatEndmill,
+        Some(_) => return Err(bad(cmd, "`finish_kind` must be ball or flat")),
+    };
+    let finish = cutter_param(s, cmd, p, "finish_", 2, finish_kind, 2)?;
+    let mut cut = SolidCut::new(material);
+    cut.tier = word(cmd, p, "tier", "careful, standard or bold")?.unwrap_or_default();
+    cut.coolant = bool_(p, "coolant").unwrap_or(true);
+    for (k, v) in [("margin", &mut cut.margin), ("stock_top", &mut cut.stock_top), ("finish_stock", &mut cut.finish_stock), ("skin", &mut cut.skin)] {
+        if let Some(given) = length_param(s, cmd, p, k)? {
+            *v = given;
+        }
+    }
+    cut.finish_stepover = length_param(s, cmd, p, "finish_stepover")?;
+
+    // The body, as the world shows it.
+    let state = s.world_state()?;
+    let body = match str_(p, "body").map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => state.body(name).ok_or_else(|| bad(cmd, format!("no body `{name}`")))?,
+        None => match state.bodies.as_slice() {
+            [one] => one,
+            [] => return Err(bad(cmd, "the design has no body to carve: model the part first")),
+            many => {
+                let names: Vec<&str> = many.iter().take(12).map(|b| b.name.as_str()).collect();
+                return Err(bad(cmd, format!("name the `body` to carve: {}", names.join(", "))));
+            }
+        },
+    };
+    if body.body.is_surface() {
+        return Err(bad(cmd, format!("`{}` is a surface, not a solid: only a solid can be carved", body.name)));
+    }
+    let name = body.name.clone();
+    // Toolpaths follow the body's triangles, as fine as an export's.
+    let mesh = solidcraft_io::export_mesh_at(&body.body, solidcraft_io::MeshQuality::Fine)?;
+    let modelled = Surface::from_mesh(&mesh).map_err(|e| bad(cmd, e.to_string()))?;
+    let bounds = modelled.bounds();
+    if modelled.is_empty() || bounds.is_empty() {
+        return Err(bad(cmd, format!("`{name}` has no surface to cut")));
+    }
+    // The work zero: the block's low X, low Y corner, on its top.
+    let [low, high] = block(bounds.min, bounds.max, &rough, &cut);
+    let zero = Vec3::new(low.x, low.y, high.z);
+    if ![low, high].iter().all(|v| v.is_finite()) {
+        return Err(bad(cmd, "the cut's sizes must be finite lengths"));
+    }
+    let surface = modelled.in_frame(&Frame { origin: zero, ..Frame::default() }).map_err(|e| bad(cmd, e.to_string()))?;
+    let plan = plan_solid(&surface, &rough, finish.as_ref(), &cut, &machine).map_err(|e| bad(cmd, e.to_string()))?;
+    let stopped = |i: &Issue| i.at.as_deref().map(|a| format!("{a}: {}", i.message)).unwrap_or_else(|| i.message.clone());
+    if let Some(stop) = plan.issues.iter().find(|i| i.severity == Severity::Error) {
+        return Err(bad(cmd, stopped(stop)));
+    }
+    if plan.operations.is_empty() {
+        return Err(bad(cmd, "there is nothing to cut"));
+    }
+    // One program a cutter: this machine changes tools by hand, and each cutter is zeroed anew.
+    let two = plan.operations.iter().any(|o| o.tool.number != rough.number);
+    let mut programs: Vec<(Program, &str)> = Vec::new();
+    for op in &plan.operations {
+        let (label, tag) = if !two {
+            (name.clone(), "")
+        } else if op.tool.number == rough.number {
+            (format!("{name} rough"), "-1-rough")
+        } else {
+            (format!("{name} finish"), "-2-finish")
+        };
+        match programs.last_mut() {
+            Some((program, _)) if program.name == label => program.operations.push(op.clone()),
+            _ => programs.push((Program { name: label, operations: vec![op.clone()], work_offset: Some(1) }, tag)),
+        }
+    }
+    let post = machine.post().map_err(|e| bad(cmd, e.to_string()))?;
+    let base = if dry_run { None } else { path_param(cmd, p)? };
+    // Every program is written out and checked before any file is.
+    let mut written: Vec<(String, String)> = Vec::new();
+    let mut replies: Vec<Value> = Vec::new();
+    let mut paths: Vec<Value> = Vec::new();
+    for (program, tag) in &programs {
+        let mut out = write_program(cmd, program, &post, Some(&machine), Vec::new(), None, None)?;
+        let cuts: Vec<Value> = program.operations.iter().map(|o| json!({"name": o.name, "rpm": o.spindle_rpm, "feed": top_feed(&o.path)})).collect();
+        out["name"] = json!(program.name);
+        out["tool"] = json!(program.operations.first().map(|o| &o.tool));
+        out["cuts"] = json!(cuts);
+        if let Some(base) = base {
+            let file = tagged_path(base, tag);
+            solidcraft_io::vfs::check(&file).map_err(|e| crate::EngineError::Other(e.to_string()))?;
+            written.push((file.clone(), out["gcode"].as_str().unwrap_or_default().to_string()));
+            out["path"] = json!(file);
+        }
+        if with_paths {
+            for o in &program.operations {
+                let points: Vec<[f64; 4]> = o
+                    .path
+                    .points(0.05)
+                    .into_iter()
+                    .map(|(at, cutting)| [at.x + zero.x, at.y + zero.y, at.z + zero.z, f64::from(u8::from(cutting))])
+                    .collect();
+                paths.push(json!({"name": o.name, "points": points}));
+            }
+        }
+        replies.push(out);
+    }
+    for (file, gcode) in &written {
+        solidcraft_io::write_atomic(std::path::Path::new(file), gcode.as_bytes(), false).map_err(|e| crate::EngineError::Other(e.to_string()))?;
+    }
+    let mut out = json!({
+        "body": name,
+        "block": {"min": [low.x, low.y, low.z], "max": [high.x, high.y, high.z]},
+        "zero": [zero.x, zero.y, zero.z],
+        "programs": replies,
+        "issues": plan.issues,
+    });
+    if with_paths {
+        out["paths"] = json!(paths);
+    }
+    if dry_run {
+        out["dry_run"] = json!(true);
+    }
+    Ok(out)
+}
+
 /// The fastest a path cuts (mm/min).
 fn top_feed(path: &solidcraft_cam::Toolpath) -> f64 {
     path.moves
@@ -1452,6 +1633,124 @@ mod tests {
             assert!(e.contains(why), "{params}: {e}");
         }
         assert_eq!(s.doc.cam.setups[0].operations.len(), 1);
+    }
+
+    #[test]
+    fn a_solid_is_carved_to_one_checked_gcode_file_a_cutter() {
+        let mut s = Session::default();
+        let ask = json!({"material": "aluminum", "tool_diameter": 6, "finish_diameter": 6});
+        let nothing = s.execute("cam.carve", &ask).unwrap_err().to_string();
+        assert!(nothing.contains("no body to carve"), "{nothing}");
+        // A 60 × 40 × 9 mm base with a dome of 8 mm radius on it: 17 mm high in all.
+        run(&mut s, "solid.box", json!({"corner": [0, 0, 0], "length": 60, "width": 40, "height": 9}));
+        run(&mut s, "solid.sphere", json!({"center": [30, 20, 9], "radius": 8, "operation": "join"}));
+        let state = s.model.state();
+        assert_eq!(state.bodies.len(), 1);
+        let body = state.bodies[0].name.clone();
+        let kept = s.doc.clone();
+
+        let dir = std::env::temp_dir().join(format!("solidcraft-cam-carve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut with_path = ask.clone();
+        with_path["path"] = json!(dir.join("dome.nc").to_string_lossy());
+        with_path["paths"] = json!(true);
+        let out = run(&mut s, "cam.carve", with_path);
+        assert_eq!(out["body"].as_str(), Some(body.as_str()));
+        // The block: 6 mm of margin and the cutter's 3 mm radius round the part, 0.5 mm above it.
+        // The work zero is its low corner, on its top.
+        let near = |got: &Value, want: &[f64]| {
+            let got: Vec<f64> = got.as_array().unwrap().iter().filter_map(Value::as_f64).collect();
+            assert!(got.len() == want.len() && got.iter().zip(want).all(|(a, b)| (a - b).abs() < 0.02), "{got:?} is not {want:?}");
+        };
+        near(&out["block"]["min"], &[-9.0, -9.0, 0.0]);
+        near(&out["block"]["max"], &[69.0, 49.0, 17.5]);
+        near(&out["zero"], &[-9.0, -9.0, 17.5]);
+        // Two cutters, two programs: roughing and the walls with the flat one, finishing with the ball.
+        let programs = out["programs"].as_array().unwrap();
+        assert_eq!(programs.len(), 2);
+        let cuts = |p: &Value| p["cuts"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str().map(str::to_string)).collect::<Vec<_>>();
+        assert_eq!(
+            (programs[0]["name"].as_str(), cuts(&programs[0])),
+            (Some(format!("{body} rough").as_str()), vec!["Rough".to_string(), "Walls".to_string()])
+        );
+        assert_eq!((programs[1]["name"].as_str(), cuts(&programs[1])), (Some(format!("{body} finish").as_str()), vec!["Finish".to_string()]));
+        assert_eq!((programs[0]["tool"]["kind"].as_str(), programs[1]["tool"]["kind"].as_str()), (Some("flat_endmill"), Some("ball_endmill")));
+        assert_eq!((programs[0]["cuts"][0]["rpm"].as_f64(), programs[0]["cuts"][0]["feed"].as_f64()), (Some(18500.0), Some(1110.0)));
+        for (program, file) in programs.iter().zip(["dome-1-rough.nc", "dome-2-finish.nc"]) {
+            assert!(program["readback"]["within"].as_bool().unwrap());
+            assert_eq!(program["machine"].as_str(), Some("flexihal-router"));
+            assert_eq!(program["path"].as_str(), Some(dir.join(file).to_string_lossy().as_ref()));
+            let written = std::fs::read_to_string(dir.join(file)).unwrap();
+            assert_eq!(Some(written.as_str()), program["gcode"].as_str());
+            assert!(written.contains("G53 G0 Z-5") && written.trim_end().ends_with("M30"));
+        }
+        assert!(!dir.join("dome.nc").exists());
+        // Roughing: the cutter's centre stays 3 mm inside the block, comes down to the skin 0.5 mm
+        // above the part's foot (17 mm below the block's top), and travels 5 mm above the block.
+        let (lo, hi) = (&programs[0]["extents"]["min"], &programs[0]["extents"]["max"]);
+        near(lo, &[3.0, 3.0, -17.0]);
+        near(hi, &[75.0, 55.0, 5.0]);
+        assert!(
+            out["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("0.50 mm skin"))),
+            "{}",
+            out["issues"]
+        );
+        // The paths come back in the model, one list a cut: nothing cuts below the skin, and the
+        // finishing passes touch the dome's top.
+        let paths = out["paths"].as_array().unwrap();
+        assert_eq!(paths.iter().filter_map(|p| p["name"].as_str()).collect::<Vec<_>>(), ["Rough", "Walls", "Finish"]);
+        let cutting = |p: &Value| p["points"].as_array().unwrap().iter().filter(|q| q[3] == 1.0).filter_map(|q| q[2].as_f64()).collect::<Vec<f64>>();
+        let low = paths.iter().flat_map(cutting).fold(f64::INFINITY, f64::min);
+        assert!((low - 0.5).abs() < 1e-6, "{low}");
+        let top = paths[2]["points"].as_array().unwrap().iter().filter(|q| {
+            let at = |k: usize| q[k].as_f64().unwrap_or(f64::NAN);
+            q[3] == 1.0 && (at(0) - 30.0).hypot(at(1) - 20.0) < 0.7 && (at(2) - 17.0).abs() < 0.05
+        });
+        assert!(top.count() > 0);
+        assert!(std::sync::Arc::ptr_eq(&s.doc, &kept), "carving keeps nothing in the design");
+
+        // One cutter makes one program, written to the file named; a dry run writes nothing.
+        let mut one = json!({"material": "aluminum", "tool_diameter": "6 mm", "path": dir.join("one.nc").to_string_lossy()});
+        let single = run(&mut s, "cam.carve", one.clone());
+        assert_eq!(single["programs"].as_array().map(Vec::len), Some(1));
+        assert_eq!((single["programs"][0]["name"].as_str(), cuts(&single["programs"][0]).len()), (Some(body.as_str()), 3));
+        assert!(dir.join("one.nc").exists());
+        assert!(single["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("ball end mill"))));
+        one["path"] = json!(dir.join("never.nc").to_string_lossy());
+        one["dry_run"] = json!(true);
+        let tried = run(&mut s, "cam.carve", one);
+        assert!(tried["dry_run"] == true && tried["programs"][0]["path"].is_null() && !dir.join("never.nc").exists());
+
+        // What cannot be cut is refused with the reason, and hostile values are errors.
+        for (change, why) in [
+            (json!({"flute_length": 10}), "mm of flute"),
+            (json!({"skin": 17}), "leaves nothing"),
+            (json!({"body": "Nowhere"}), "no body `Nowhere`"),
+            (json!({"finish_kind": "drill"}), "`finish_kind` must be ball or flat"),
+            (json!({"material": "cheese"}), "`material` must be one of"),
+            (json!({"tool_diameter": null}), "`tool_diameter` is required"),
+            (json!({"tool_diameter": -6}), "diameter"),
+            (json!({"margin": 1.0e9}), "margin"),
+            (json!({"finish_stepover": 0}), "stepover"),
+            (json!({"flutes": 2.5}), "`flutes` must be a whole number"),
+            (json!({"path": ""}), "`path` must be a file name"),
+        ] {
+            let mut bad_ask = ask.clone();
+            for (k, v) in change.as_object().unwrap() {
+                bad_ask[k] = v.clone();
+            }
+            let e = s.execute("cam.carve", &bad_ask).unwrap_err().to_string();
+            assert!(e.contains(why), "{bad_ask}: {e}");
+        }
+        // With a second body, the one to carve has to be named.
+        run(&mut s, "solid.box", json!({"corner": [100, 0, 0], "length": 10, "width": 10, "height": 5}));
+        let which = s.execute("cam.carve", &ask).unwrap_err().to_string();
+        assert!(which.contains("name the `body` to carve"), "{which}");
+        let mut named = ask.clone();
+        named["body"] = json!(body);
+        named["dry_run"] = json!(true);
+        assert_eq!(run(&mut s, "cam.carve", named)["programs"].as_array().map(Vec::len), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

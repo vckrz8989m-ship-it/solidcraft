@@ -18,7 +18,7 @@
 //! part, is left for the part to be turned over.
 
 use serde::{Deserialize, Serialize};
-use solidcore_record::Vec2;
+use solidcore_record::{Vec2, Vec3};
 
 use crate::router::auto::Planned;
 use crate::router::feeds::{CutKind, FeedRequest, Material, Recipe, Tier, recipe};
@@ -95,6 +95,20 @@ impl SolidCut {
     }
 }
 
+/// How far beyond the part's sides the roughing cutter's centre goes (mm): the margin asked
+/// for, and at least what the cutter needs to stand beside the part with the finishing stock on.
+fn reach(rough: &Tool, cut: &SolidCut) -> f64 {
+    cut.margin.max(rough.radius() + cut.finish_stock)
+}
+
+/// The block [`plan_solid`] carves a part of extent `lo` to `hi` from, as its low and high
+/// corners: the part's extent, grown sideways as far as the roughing cutter's edge goes and
+/// upwards by the stock above the part. The stock on the table must be at least this large.
+pub fn block(lo: Vec3, hi: Vec3, rough: &Tool, cut: &SolidCut) -> [Vec3; 2] {
+    let side = reach(rough, cut) + rough.radius();
+    [Vec3::new(lo.x - side, lo.y - side, lo.z), Vec3::new(hi.x + side, hi.y + side, hi.z + cut.stock_top)]
+}
+
 /// Levels no deeper than `deepest` that share `total` evenly.
 fn even_stepdown(total: f64, deepest: f64) -> f64 {
     let passes = (total / deepest.max(1e-6) - 1e-9).ceil().max(1.0);
@@ -167,7 +181,7 @@ pub fn plan_solid(surface: &Surface, rough: &Tool, finish: Option<&Tool>, cut: &
     // it must to come down the part's sides.
     let rect =
         |beyond: f64| Boundary { rect: Some([Vec2::new(lo.x - beyond, lo.y - beyond), Vec2::new(hi.x + beyond, hi.y + beyond)]), region: None };
-    let margin = cut.margin.max(rough.radius() + cut.finish_stock);
+    let margin = reach(rough, cut);
     let add = |plan: &mut Planned, name: &str, tool: &Tool, rpm: f64, path: crate::Toolpath| {
         if !path.moves.is_empty() {
             plan.operations.push(Operation { name: name.to_string(), tool: tool.clone(), spindle_rpm: rpm, coolant: cut.coolant, path });

@@ -417,6 +417,8 @@ crate::dialog_descriptor::dialog_descriptors! {
             },
             /// Cut Out Part to G-code (`dialogs_cut_out`).
             CutOut(crate::dialogs_cut_out::CutOut),
+            /// Carve Solid to G-code (`dialogs_carve`).
+            Carve(crate::dialogs_carve::Carve),
             /// Insert SVG / DXF: where the picked drawing goes (`dialogs_insert_drawing`).
             InsertDrawing(crate::dialogs_insert_drawing::Place),
             /// Plastic features (`dialogs_plastic`).
@@ -1154,6 +1156,7 @@ impl Dialog {
                     .or_else(|| crate::dialogs_save_mesh::start(app, id))
                     .or_else(|| crate::dialogs_view_dxf::start(app, id))
                     .or_else(|| crate::dialogs_cut_out::start(app, id))
+                    .or_else(|| crate::dialogs_carve::start(app, id))
                     .or_else(|| crate::view_gizmo::start(app, id))
                     .or_else(|| crate::dialogs_plastic::start(app, id))
                     .or_else(|| crate::dialogs_frame::start(app, id))
@@ -2729,6 +2732,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::SaveMesh(_) => "SAVE AS MESH",
         Kind::ViewDxf { .. } => "Export Current View as DXF",
         Kind::CutOut(_) => "CUT OUT PART",
+        Kind::Carve(_) => "CARVE SOLID",
         Kind::ViewNavigator(_) => "CUSTOM VIEW NAVIGATOR",
         Kind::InsertDrawing(p) => crate::dialogs_insert_drawing::title(p),
         Kind::Plastic(k) => k.title(),
@@ -3898,7 +3902,7 @@ pub(crate) fn action_labels(kind: &Kind) -> (&'static str, &'static str) {
         Kind::ConfirmDelete { .. } => ("Delete", "Cancel"),
         Kind::SaveMesh(k) => (crate::dialogs_save_mesh::button(k), "Cancel"),
         Kind::ViewDxf { .. } => ("Export DXF…", "Cancel"),
-        Kind::CutOut(_) => ("Save G-code…", "Cancel"),
+        Kind::CutOut(_) | Kind::Carve(_) => ("Save G-code…", "Cancel"),
         _ => ("OK", "Cancel"),
     }
 }
@@ -5153,6 +5157,9 @@ pub(crate) fn run_dialog(app: &mut SolveApp, d: &Dialog) -> Result<(), String> {
     if let Kind::CutOut(k) = &d.kind {
         return crate::dialogs_cut_out::run(app, k);
     }
+    if let Kind::Carve(k) = &d.kind {
+        return crate::dialogs_carve::run(app, k);
+    }
     // Saving asks for a file name first; `Err("")` is the user backing out of that.
     if let Kind::SaveMesh(k) = &d.kind {
         return crate::dialogs_save_mesh::run(app, k, &d.inputs);
@@ -6345,7 +6352,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         Kind::Surface(k) => return crate::dialogs_surface::commands(app, k, &d.inputs, &d.extra),
         Kind::SketchModify(k) => return crate::sketch_modify_ui::commands(app, k, &d.inputs, &d.extra),
         Kind::SaveMesh(k) => return crate::dialogs_save_mesh::commands(k, &d.inputs),
-        Kind::ViewDxf { .. } | Kind::ViewNavigator(_) | Kind::CutOut(_) => return Ok(Vec::new()),
+        Kind::ViewDxf { .. } | Kind::ViewNavigator(_) | Kind::CutOut(_) | Kind::Carve(_) => return Ok(Vec::new()),
         Kind::InsertDrawing(p) => return crate::dialogs_insert_drawing::commands(p),
         Kind::Plastic(k) => return crate::dialogs_plastic::commands(app, k, &d.inputs, &d.extra),
         Kind::Frame(k) => return crate::dialogs_frame::commands(app, k, &d.inputs, &d.extra),

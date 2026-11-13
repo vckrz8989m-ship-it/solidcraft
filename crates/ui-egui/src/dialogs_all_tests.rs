@@ -903,6 +903,7 @@ fn remaining_dialogs_keep_kit_chrome_and_cancel_restores_preview() {
         "file.save_mesh",
         "file.export_view_dxf",
         "cam.cut_out",
+        "cam.carve",
         "sheet.flat_pattern",
     ] {
         let mut h = fixture();
@@ -944,6 +945,7 @@ fn top_dialog_buttons_keep_every_cards_states_handles_and_close() {
         "file.save_mesh",
         "file.export_view_dxf",
         "cam.cut_out",
+        "cam.carve",
         "sheet.flat_pattern",
     ] {
         let mut seen = Vec::new();

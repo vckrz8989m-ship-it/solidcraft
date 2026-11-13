@@ -20,7 +20,7 @@ use solidcraft_engine::doc::cam::CamGeometry;
 use solidcraft_theme::Tokens;
 
 /// The materials, as `cam.cut_out` names them, and their labels.
-const MATERIALS: [(&str, &str); 7] = [
+pub(crate) const MATERIALS: [(&str, &str); 7] = [
     ("aluminum", "Aluminium 6061"),
     ("aluminum_soft", "Aluminium, soft or cast"),
     ("brass", "Brass"),
@@ -30,8 +30,8 @@ const MATERIALS: [(&str, &str); 7] = [
     ("softwood", "Softwood, plywood and MDF"),
 ];
 /// How hard to cut, as `cam.cut_out` names it, and its label.
-const TIERS: [(&str, &str); 3] = [("careful", "Careful (first cut)"), ("standard", "Standard"), ("bold", "Bold (proven machine)")];
-const FLUTES: [&str; 4] = ["1", "2", "3", "4"];
+pub(crate) const TIERS: [(&str, &str); 3] = [("careful", "Careful (first cut)"), ("standard", "Standard"), ("bold", "Bold (proven machine)")];
+pub(crate) const FLUTES: [&str; 4] = ["1", "2", "3", "4"];
 /// What holds the part while its outside is cut through, as `cam.cut_out` names it, and its label.
 const HOLDS: [(&str, &str); 2] = [("tabs", "Holding tabs"), ("none", "None (screws or tape)")];
 /// The setup the dialog's parts are kept in.
@@ -272,7 +272,7 @@ fn params(k: &CutOut) -> Result<Value, String> {
 }
 
 /// A reply's paths as runs: each cut, and each move between cuts, a line of its own.
-fn runs(reply: &Value) -> Vec<Run> {
+pub(crate) fn runs(reply: &Value) -> Vec<Run> {
     let mut out: Vec<Run> = Vec::new();
     for path in reply["paths"].as_array().into_iter().flatten() {
         let mut last: Option<[f64; 3]> = None;
@@ -297,10 +297,15 @@ pub fn show(app: &SolveApp, painter: &egui::Painter, proj: &crate::viewport::Pro
     if k.paths.is_empty() || k.refused || k.report_of != planned_for(app, k) {
         return;
     }
+    draw(painter, proj, &k.paths);
+}
+
+/// Planned paths over the part: cuts in the accent colour, the moves between them faintly.
+pub(crate) fn draw(painter: &egui::Painter, proj: &crate::viewport::Proj, paths: &[Run]) {
     let (theme, view) = (Tokens::get(), Tokens::view());
-    let total: usize = k.paths.iter().map(|r| r.points.len()).sum();
+    let total: usize = paths.iter().map(|r| r.points.len()).sum();
     let every = total.div_ceil(MAX_DRAWN).max(1);
-    for run in &k.paths {
+    for run in paths {
         let stroke = if run.cutting { egui::Stroke::new(1.5, theme.accent) } else { egui::Stroke::new(1.0, view.text.gamma_multiply(0.35)) };
         let last = run.points.len().saturating_sub(1);
         // What is behind the camera breaks the line; the rest is drawn.
@@ -325,7 +330,7 @@ pub fn show(app: &SolveApp, painter: &egui::Painter, proj: &crate::viewport::Pro
     }
 }
 
-fn number(v: &Value) -> String {
+pub(crate) fn number(v: &Value) -> String {
     v.as_f64().map_or_else(|| "?".into(), |x| format!("{}", (x * 10.0).round() / 10.0))
 }
 
