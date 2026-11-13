@@ -430,6 +430,8 @@ mod tests {
         let k = form(&h);
         assert_eq!((k.material, k.thickness.as_str(), k.diameter.as_str(), k.flutes, k.tier, k.hold), (0, "6 mm", "6 mm", 0, 1, 0));
         assert!(k.sketch != 0 && k.report.is_empty() && k.paths.is_empty() && k.pocket_sketch == 0);
+        // No field takes the keyboard as it opens (see `dialogs_dense::rows`).
+        assert!(h.ctx.memory(|m| m.focused()).is_none(), "a field has the keyboard");
 
         // Check lists the plan and changes nothing.
         let design = h.app.session.doc.to_json();

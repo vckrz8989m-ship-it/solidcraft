@@ -433,7 +433,14 @@ pub(super) fn rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: 
         Kind::PartSize(k) => enter |= crate::dialogs_part_size::rows(app, ui, k),
         Kind::SaveMesh(k) => enter |= crate::dialogs_save_mesh::rows(app, ui, k, &mut d.inputs),
         Kind::ViewDxf { dashed, tolerance } => crate::dialogs_view_dxf::rows(app, ui, dashed, tolerance),
-        Kind::CutOut(k) => enter |= crate::dialogs_cut_out::rows(app, ui, k),
+        Kind::CutOut(k) => {
+            // Its first choice is a sketch, not a value to type. The keyboard sent to its first
+            // value field as the dialog opens selects the field's text, and the field then
+            // scrolls itself into a view that has no height yet: in a short window the dialog
+            // opened scrolled past its first row (seen at 1366 x 720).
+            d.focus = false;
+            enter |= crate::dialogs_cut_out::rows(app, ui, k);
+        }
         Kind::ViewNavigator(form) => crate::view_gizmo::rows(app, ui, form, &d.inputs),
         Kind::InsertDrawing(p) => crate::dialogs_insert_drawing::rows(ui, p),
         Kind::Sketch => {
