@@ -48,6 +48,8 @@ pub struct CutOut {
     /// What Check last found, a line each; the flag says the plan was refused.
     pub report: Vec<String>,
     pub refused: bool,
+    /// The values and the design the report was made for: any other and it is not shown.
+    pub report_of: String,
 }
 
 /// The design's sketches, oldest first: (feature id, name).
@@ -81,6 +83,7 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         hold: 0,
         report: Vec::new(),
         refused: false,
+        report_of: String::new(),
     };
     // The part cut out last gives the plate and the cutter; the sketch stays the newest.
     let cam = &app.session.doc.cam;
@@ -166,9 +169,13 @@ fn check(app: &SolveApp, k: &CutOut) -> (Vec<String>, bool) {
     }
 }
 
+/// What a plan depends on: the dialog's values and the design as it stands.
+fn planned_for(app: &SolveApp, k: &CutOut) -> String {
+    format!("{:?}", (app.session.revision, k.sketch, k.material, &k.thickness, &k.diameter, k.flutes, &k.flute_length, k.tier, k.hold))
+}
+
 pub fn rows(app: &SolveApp, ui: &mut egui::Ui, k: &mut CutOut) -> bool {
     let tr = solidcraft_ui_text::tr_label;
-    let before = k.clone();
     let mut enter = false;
     let list = sketches(app);
     form_row(ui, "Outline sketch", |ui| {
@@ -198,9 +205,9 @@ pub fn rows(app: &SolveApp, ui: &mut egui::Ui, k: &mut CutOut) -> bool {
         let labels: Vec<&str> = HOLDS.iter().map(|h| tr(h.1)).collect();
         combo(ui, "cut_out_hold", &labels, &mut k.hold);
     });
-    // A changed value makes the last plan another part's.
-    let values = |k: &CutOut| (k.sketch, k.material, k.thickness.clone(), k.diameter.clone(), k.flutes, k.flute_length.clone(), k.tier, k.hold);
-    if values(&before) != values(k) {
+    // A changed value, or a changed design, makes the last plan another part's.
+    let now = planned_for(app, k);
+    if k.report_of != now {
         k.report.clear();
         k.refused = false;
     }
@@ -209,6 +216,7 @@ pub fn rows(app: &SolveApp, ui: &mut egui::Ui, k: &mut CutOut) -> bool {
         crate::scenario::publish_handle("dialog:cut_out:check", r.rect.center());
         if r.clicked() {
             (k.report, k.refused) = check(app, k);
+            k.report_of = now.clone();
         }
     });
     for (i, line) in k.report.iter().enumerate() {
