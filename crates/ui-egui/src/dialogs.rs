@@ -4056,8 +4056,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         panel.width(card_width(&d) + label_grow).grow_label(grow_key)
     };
     let reset_scroll = d.reset_scroll;
-    let panel =
-        panel.reset_scroll(reset_scroll && matches!(d.kind, Kind::Appearance(_) | Kind::Motion(crate::dialogs_motion::Mo::Configurations { .. })));
+    // The G-code dialogs are taller than a short window and their Check button is at the foot:
+    // left scrolled there, they would open with their first rows out of sight.
+    let from_top =
+        matches!(d.kind, Kind::Appearance(_) | Kind::Motion(crate::dialogs_motion::Mo::Configurations { .. }) | Kind::CutOut(_) | Kind::Carve(_));
+    let panel = panel.reset_scroll(reset_scroll && from_top);
     let window = panel.window(ctx);
     let repeatable =
         matches!(&d.kind, Kind::SketchModify(k) if crate::sketch_modify_ui::repeatable(k)) && d.editing.is_none() && !d.extra.contains_key("pattern");
