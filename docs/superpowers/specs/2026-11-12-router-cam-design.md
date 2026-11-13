@@ -61,8 +61,15 @@ is made on the window thread, so the app waits while a large part is planned; th
 follow a fine mesh of the body, not its exact surfaces.
 
 How far the 3D carving is tested: the planner, the command and the dialog pass their tests on
-a domed part (the dialog on the headless harness). It has not been run on a real screen, the
-G-code has not been simulated in ioSender, and nothing has been cut with it.
+a domed part (the dialog on the headless harness). Build 8 was run on the laptop's screen:
+the dialog opens, Check lists the plan and draws the paths, and the command writes both
+files. Both files of the domed part went through grblHAL's own code (the grblHAL simulator
+for Windows, build 20261112, default settings): in check mode it refused no line of the
+roughing file (53 408 lines) or the finishing file (16 246 lines). ioSender 2.0.47 loaded
+both with the planned program limits and ran the finishing file against the simulator to
+its end (Idle, spindle and coolant off, Z at the safe retract). The simulator has default
+settings, not this machine's, so travel limits, speeds and the spindle are untested, and
+nothing has been cut.
 
 Not built yet: drilling and helical bores as operations of their own, a finishing pass on
 pocket floors, a tool library with proven recipes, schemas for the CAM commands, carving a
