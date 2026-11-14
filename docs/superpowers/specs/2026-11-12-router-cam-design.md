@@ -67,7 +67,10 @@ files. Both files of the domed part went through grblHAL's own code (the grblHAL
 for Windows, build 20261112, default settings): in check mode it refused no line of the
 roughing file (53 408 lines) or the finishing file (16 246 lines). ioSender 2.0.47 loaded
 both with the planned program limits and ran the finishing file against the simulator to
-its end (Idle, spindle and coolant off, Z at the safe retract). The simulator has default
+its end (Idle, spindle and coolant off, Z at the safe retract). The Bolted Flange sample
+(the hub: a 118 x 118 x 26.5 mm block, cutters with 30 mm of flute) was carved the same way
+with build 9: grblHAL's check mode refused no line of its roughing file (257 769 lines) or
+its finishing file (46 444 lines). The simulator has default
 settings, not this machine's, so travel limits, speeds and the spindle are untested, and
 nothing has been cut.
 
