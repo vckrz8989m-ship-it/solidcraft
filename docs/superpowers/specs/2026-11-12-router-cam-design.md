@@ -78,6 +78,68 @@ Not built yet: drilling and helical bores as operations of their own, a finishin
 pocket floors, a tool library with proven recipes, schemas for the CAM commands, carving a
 second side.
 
+## Thread milling in plate parts (2026-11-19)
+
+Why: Mark wants screw threads in plate parts without hand tapping. Asked for in chat and
+approved there as: a thread choice for each hole, the end mill bores the hole to size in the
+normal job, threading is a file of its own run after changing to the thread mill and zeroing
+its height, Check shows the thread passes and time, and a saved fit per thread mill.
+
+Goals: a round hole of a plate part can be given a thread from a list; the part's G-code then
+bores that hole to the thread's bore size, and a second file mills the thread with a
+single-form 60° thread mill. Not goals: blind threads, threads in pockets or in carved solids,
+external threads, multi-form thread mills, pipe threads, a thread drawn in the model. It
+would be a failure if a thread were cut in the wrong hole, if the thread mill were sent into
+material no cutter has cleared, or if a job with threads wrote one file that changes tools
+without a new height zero.
+
+Approaches considered:
+1. Thread per hole, chosen in Cut Out Part, bored by the end mill, a second file (chosen):
+   one dialog, no drilling by hand, and each cutter gets its own zero as in Carve.
+2. A thread operation of its own (`cam.op.thread`) on holes drilled beforehand: more steps,
+   and the hole size is left to the user, who then has to know tap drill sizes.
+3. One file with a tool-change stop: a stop in the program gives no way to zero the new
+   tool on this machine, so the thread mill would run at the end mill's height.
+
+How it works:
+- `router/threads.rs` holds the thread table: 10-24, 10-32, 1/4-20, 1/4-28, 5/16-18, 5/16-24,
+  3/8-16, 3/8-24, M5, M6, M8 and M10 (coarse pitches). The bore is the major diameter less one
+  pitch (the tap drill rule), so the mill cuts half a pitch deep on the radius.
+- A threaded hole is named by its centre in the setup's XY (`threads: [{at: [x, y], thread}]`).
+  It must be a round opening of the part: one that is not there stops the plan, since the
+  sketch has changed under the choice. The drawn diameter does not matter: the opening is cut
+  at the bore size. A cutter that does not fit the bore stops the plan (no centre mark).
+- Through threads only. The thread mill's tip goes a pitch and 0.5 mm below the plate so the
+  thread runs out of the bottom, and starts half a pitch above the top. The end mill
+  therefore bores a threaded hole a pitch and 1 mm below the plate (into the spoilboard), so
+  the thread mill's end never meets uncut material; the plan says how deep.
+- The thread is cut by `helical::thread_mill` (upstream): internal, right-hand, climb, from
+  the bottom up, one pitch a turn, in two radial passes in metals when the pitch is 1 mm or
+  less and three above it (one and two in plastics and wood, one more on the careful tier),
+  then a spring pass. One operation a thread size, nearest hole first.
+- Feed: chip per tooth 0.004 of the thread mill's diameter (0.6 of that careful, 1.3 bold),
+  at the spindle's lowest speed that gives 120 m/min or more; the feed written is the tool
+  centre's, the edge feed times (major - cutter) / major. A starting point, not a proven recipe.
+- Fit: millimetres added to the thread's major diameter (-0.2 to 0.5, default 0): above 0 cuts
+  deeper and loosens the thread. Kept with each remembered thread mill in the dialog.
+- The thread mill is a `ThreadMill` tool: diameter, flutes and reach (kept as its flute
+  length). Its reach must cover the plate and what it goes below it; it must fit the bore.
+- `cam.cut_out` with threads writes two files, `-1-cut` and `-2-thread` before the extension,
+  both checked before either is written; its reply gains `thread` (the second program as
+  the first is told) and the saved part keeps `threads`, `thread_tool` and `thread_fit`.
+  `cam.holes` lists a part's round openings (name, centre, diameter) for a front end.
+  `cam.post` of a setup whose part has threads puts them after the cuts in one program, with
+  the post's tool-change stop, as for any setup with two tools.
+- Cut Out Part lists the round holes with a thread choice each; once one is chosen it asks for
+  the thread mill (remembered ones by name) and the fit. Check lists the thread file's time
+  and cuts after the first file's.
+
+Left to the builder: wording of messages, the row layout in the dialog.
+
+Limits to state: the part is on its holding tabs while it is threaded; the tooth is taken to
+be at the thread mill's tip; threads smaller than 10-24 are not offered; feeds and the bore
+size are untested on the machine, so the first thread is a test hole in scrap.
+
 ## Scope
 
 In version 1:
