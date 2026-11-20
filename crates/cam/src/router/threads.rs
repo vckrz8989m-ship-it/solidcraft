@@ -123,7 +123,7 @@ pub fn thread_feed(thread: &Thread, fit: f64, tool: &Tool, material: Material, t
     }
     if !(tool.diameter <= thread.widest_mill()) {
         return invalid(format!(
-            "the ⌀{} mm thread mill does not fit the ⌀{} mm hole of a {} thread: use one of at most ⌀{} mm",
+            "the Ø{} mm thread mill does not fit the Ø{} mm hole of a {} thread: use one of at most Ø{} mm",
             mm(tool.diameter),
             mm(thread.bore()),
             thread.name,

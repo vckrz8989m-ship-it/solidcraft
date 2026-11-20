@@ -656,7 +656,7 @@ pub fn rows(app: &SolveApp, ui: &mut egui::Ui, k: &mut CutOut) -> bool {
         crate::ui_kit::text(ui, tr("Threads in round holes"), crate::ui_kit::Text::Note("cut_out_threads"));
         let listed: Vec<Hole> = k.holes.iter().take(MAX_HOLE_ROWS).cloned().collect();
         for (i, hole) in listed.iter().enumerate() {
-            let label = format!("⌀{} · X{} Y{}", short(hole.diameter), short(hole.at[0]), short(hole.at[1]));
+            let label = format!("Ø{} · X{} Y{}", short(hole.diameter), short(hole.at[0]), short(hole.at[1]));
             form_row(ui, &label, |ui| {
                 let labels: Vec<&str> = std::iter::once(tr("No thread")).chain(k.thread_names.iter().map(String::as_str)).collect();
                 let was = k.thread_of(hole.at).and_then(|name| k.thread_names.iter().position(|n| n == name)).map_or(0, |n| n + 1);
@@ -1025,7 +1025,7 @@ mod tests {
         let (time, cut) = (line(&["Thread milling time", "min"]).expect("its time"), line(&["Thread 1/4-20, 1 hole", "12000 rpm"]).expect("its cut"));
         assert!(line(&["Outside finish"]).expect("the cuts") < time && time < cut, "{:?}", k.report);
         // What the cutter does for the thread is told with its cuts, what the thread mill does with its own.
-        assert!(line(&["Warning", "⌀5.08 mm", "spoilboard"]).is_some_and(|i| i < time), "{:?}", k.report);
+        assert!(line(&["Warning", "Ø5.08 mm", "spoilboard"]).is_some_and(|i| i < time), "{:?}", k.report);
         assert!(line(&["Warning", "thread mill goes 1.77 mm below the plate"]).is_some_and(|i| i > cut), "{:?}", k.report);
         assert_eq!(k.report.iter().filter(|l| l.starts_with("X ")).count(), 1, "the thread file's extents are not told again: {:?}", k.report);
         // Its paths are drawn with the cuts': the thread mill goes 1.77 mm under the 6 mm plate, the bore 2.27 mm.

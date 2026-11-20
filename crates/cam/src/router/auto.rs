@@ -442,7 +442,7 @@ pub fn plan_part_threaded(
                 };
             let stop = if !holds {
                 Some(format!(
-                    "the ⌀{} mm hole of a {} thread at X {} Y {} is wider than the ⌀{} mm hole drawn there, and would cut through the part's \
+                    "the Ø{} mm hole of a {} thread at X {} Y {} is wider than the Ø{} mm hole drawn there, and would cut through the part's \
                      edge or into another opening: choose the thread for another hole, or move the hole",
                     mm(thread.bore()),
                     thread.name,
@@ -452,7 +452,7 @@ pub fn plan_part_threaded(
                 ))
             } else if !(d <= thread.widest_cutter()) {
                 Some(format!(
-                    "the {} mm cutter does not fit the ⌀{} mm hole of a {} thread with room for its chips: use a cutter of at most {} mm, or \
+                    "the {} mm cutter does not fit the Ø{} mm hole of a {} thread with room for its chips: use a cutter of at most {} mm, or \
                      take the thread off the hole",
                     mm(d),
                     mm(thread.bore()),
@@ -468,7 +468,7 @@ pub fn plan_part_threaded(
                 ))
             } else if !(t.tool.diameter <= thread.widest_mill()) {
                 Some(format!(
-                    "the ⌀{} mm thread mill does not fit the ⌀{} mm hole of a {} thread: use one of at most ⌀{} mm",
+                    "the Ø{} mm thread mill does not fit the Ø{} mm hole of a {} thread: use one of at most Ø{} mm",
                     mm(t.tool.diameter),
                     mm(thread.bore()),
                     thread.name,
@@ -688,7 +688,7 @@ pub fn plan_part_threaded(
             plan.issues.push(Issue::warning(
                 None,
                 format!(
-                    "{} bored ⌀{} mm whatever was drawn, and {} mm below the plate, into the spoilboard, for the thread to run out of the bottom",
+                    "{} bored Ø{} mm whatever was drawn, and {} mm below the plate, into the spoilboard, for the thread to run out of the bottom",
                     if n == 1 {
                         format!("the hole of the {} thread is", thread.name)
                     } else {
@@ -702,7 +702,7 @@ pub fn plan_part_threaded(
                 plan.issues.push(Issue::warning(
                     None,
                     format!(
-                        "the {} mm cutter has little room for chips in the ⌀{} mm hole of a {} thread: clear them with air, or use a smaller cutter",
+                        "the {} mm cutter has little room for chips in the Ø{} mm hole of a {} thread: clear them with air, or use a smaller cutter",
                         mm(d),
                         mm(thread.bore()),
                         thread.name

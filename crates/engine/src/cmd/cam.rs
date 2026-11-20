@@ -2326,7 +2326,7 @@ mod tests {
         let said = |reply: &Value, words: &[&str]| {
             reply["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| words.iter().all(|w| m.contains(w))))
         };
-        assert!(said(&out, &["⌀5.08 mm", "2.27 mm below the plate", "spoilboard"]), "{}", out["issues"]);
+        assert!(said(&out, &["Ø5.08 mm", "2.27 mm below the plate", "spoilboard"]), "{}", out["issues"]);
         assert!(said(thread, &["thread mill goes 1.77 mm below the plate"]) && !said(thread, &["spoilboard"]), "{}", thread["issues"]);
         // The thread file says in its first line what must have run before it.
         assert!(thread_text.lines().next().is_some_and(|l| l.contains("threads") && l.contains("run after the cut file")), "{thread_text}");
