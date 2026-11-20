@@ -6,6 +6,10 @@
 //! written or kept until Save G-code. The values start from the part the design last cut out,
 //! else from the last program saved in any design; the cutters used before are offered by name
 //! (`6 mm · 1F · 18 mm`: diameter, flutes, flute length), kept in the preferences ([`Memory`]).
+//!
+//! The part's round holes are listed (`cam.holes`), each with a thread to choose. Once one has
+//! a thread the dialog asks for the thread mill (those used before by name, each with the fit
+//! it was last used at), and Save G-code writes two files: the cuts, then the threads.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,6 +45,45 @@ const MAX_DRAWN: usize = 60_000;
 
 /// Most cutters remembered.
 const MAX_CUTTERS: usize = 12;
+/// Most holes listed with a thread to choose.
+const MAX_HOLE_ROWS: usize = 40;
+
+/// A thread mill as the dialog's fields hold it, with the fit it was last used at.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ThreadCutter {
+    pub diameter: String,
+    /// Number of flutes, 1 to 4.
+    pub flutes: usize,
+    pub reach: String,
+    /// Added to the threads' major diameter: above 0 loosens them.
+    #[serde(default)]
+    pub fit: String,
+}
+
+impl ThreadCutter {
+    /// `4.572 mm · 3F · 12 mm`: diameter, flutes, reach.
+    pub fn label(&self) -> String {
+        format!("{} · {}F · {}", self.diameter.trim(), self.flutes, self.reach.trim())
+    }
+
+    fn same(&self, other: &ThreadCutter) -> bool {
+        self.diameter.trim() == other.diameter.trim() && self.flutes == other.flutes && self.reach.trim() == other.reach.trim()
+    }
+}
+
+/// A round hole of the part, as `cam.holes` lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hole {
+    pub name: String,
+    /// Its centre in the setup's XY (mm).
+    pub at: [f64; 2],
+    pub diameter: f64,
+}
+
+/// A hole's centre to the micrometre: what a thread choice is kept by.
+fn spot(at: [f64; 2]) -> [i64; 2] {
+    [(at[0] * 1000.0).round() as i64, (at[1] * 1000.0).round() as i64]
+}
 
 /// A cutter as the dialog's fields hold it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -78,6 +121,9 @@ pub struct Memory {
     pub hold: String,
     #[serde(default)]
     pub pocket_depth: String,
+    /// The thread mills used, newest first.
+    #[serde(default)]
+    pub thread_mills: Vec<ThreadCutter>,
 }
 
 impl Memory {
@@ -88,6 +134,14 @@ impl Memory {
             (1..=FLUTES.len()).contains(&c.flutes) && !c.diameter.trim().is_empty() && c.diameter.len() <= 64 && c.flute_length.len() <= 64
         });
         memory.cutters.truncate(MAX_CUTTERS);
+        memory.thread_mills.retain(|c| {
+            (1..=FLUTES.len()).contains(&c.flutes)
+                && !c.diameter.trim().is_empty()
+                && c.diameter.len() <= 64
+                && c.reach.len() <= 64
+                && c.fit.len() <= 64
+        });
+        memory.thread_mills.truncate(MAX_CUTTERS);
         memory
     }
 }
@@ -122,6 +176,21 @@ pub struct CutOut {
     /// The sketch whose closed shapes are pockets (a feature id; 0: none).
     pub pocket_sketch: u64,
     pub pocket_depth: String,
+    /// The part's round holes, read for `holes_of` (the outline's sketch and the design).
+    pub holes: Vec<Hole>,
+    pub holes_of: String,
+    /// The threads `cam.holes` offers, by name.
+    pub thread_names: Vec<String>,
+    /// The threads chosen: a hole's centre to the micrometre, and the thread's name.
+    pub threads: Vec<([i64; 2], String)>,
+    /// The thread mills offered by name, and the one chosen; past their end, a new one typed.
+    pub thread_mills: Vec<ThreadCutter>,
+    pub thread_mill: usize,
+    pub tm_diameter: String,
+    /// Index into [`FLUTES`].
+    pub tm_flutes: usize,
+    pub tm_reach: String,
+    pub tm_fit: String,
     /// The paths of the plan Check last made, drawn over the part.
     pub paths: Vec<Run>,
     /// What Check last found, a line each; the flag says the plan was refused.
@@ -129,6 +198,60 @@ pub struct CutOut {
     pub refused: bool,
     /// The values and the design the report was made for: any other and it is not shown.
     pub report_of: String,
+}
+
+impl CutOut {
+    /// The thread chosen for the hole at `at`.
+    pub fn thread_of(&self, at: [f64; 2]) -> Option<&str> {
+        let key = spot(at);
+        self.threads.iter().find(|t| t.0 == key).map(|t| t.1.as_str())
+    }
+
+    /// Give the hole at `at` the thread called `thread`; an empty name takes its thread off.
+    pub fn set_thread(&mut self, at: [f64; 2], thread: &str) {
+        let key = spot(at);
+        self.threads.retain(|t| t.0 != key);
+        if !thread.trim().is_empty() {
+            self.threads.push((key, thread.trim().to_owned()));
+        }
+    }
+
+    /// The thread mill in the fields.
+    fn typed_mill(&self) -> ThreadCutter {
+        ThreadCutter {
+            diameter: self.tm_diameter.trim().to_owned(),
+            flutes: self.tm_flutes + 1,
+            reach: self.tm_reach.trim().to_owned(),
+            fit: self.tm_fit.trim().to_owned(),
+        }
+    }
+}
+
+/// The round holes of the part `sketch` draws and the threads offered for them: what
+/// `cam.holes` replies on a copy of the design. None while the sketch gives no part.
+fn holes(app: &SolveApp, sketch: u64) -> (Vec<Hole>, Vec<String>) {
+    if sketch == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let asked = [("cam.holes".to_string(), json!({"sketch": sketch, "setup": SETUP}))];
+    let Ok(preview) = app.session.preview(&asked) else { return (Vec::new(), Vec::new()) };
+    let Some(reply) = preview.replies.first() else { return (Vec::new(), Vec::new()) };
+    let found = reply["holes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|h| {
+            let (x, y, diameter) = (h["at"][0].as_f64()?, h["at"][1].as_f64()?, h["diameter"].as_f64()?);
+            Some(Hole { name: h["name"].as_str()?.to_owned(), at: [x, y], diameter })
+        })
+        .collect();
+    let names = reply["threads"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_owned)).collect();
+    (found, names)
+}
+
+/// A number as a row's label shows it: at most three decimals.
+fn short(v: f64) -> String {
+    format!("{}", (v * 1000.0).round() / 1000.0)
 }
 
 /// The design's sketches, oldest first: (feature id, name).
@@ -171,6 +294,16 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         cutter: 0,
         pocket_sketch: 0,
         pocket_depth: "2 mm".into(),
+        holes: Vec::new(),
+        holes_of: String::new(),
+        thread_names: Vec::new(),
+        threads: Vec::new(),
+        thread_mills: Vec::new(),
+        thread_mill: 0,
+        tm_diameter: "3.429 mm".into(),
+        tm_flutes: 2,
+        tm_reach: "12 mm".into(),
+        tm_fit: "0 mm".into(),
         paths: Vec::new(),
         report: Vec::new(),
         refused: false,
@@ -188,7 +321,12 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         k.pocket_depth = memory.pocket_depth.clone();
     }
     k.cutters = memory.cutters;
-    for t in &app.session.doc.cam.tools {
+    k.thread_mills = memory.thread_mills;
+    if let Some(first) = k.thread_mills.first() {
+        (k.tm_diameter, k.tm_flutes, k.tm_reach, k.tm_fit) = (first.diameter.clone(), first.flutes - 1, first.reach.clone(), first.fit.clone());
+    }
+    // A thread mill is not a cutter to cut the part out with.
+    for t in app.session.doc.cam.tools.iter().filter(|t| json!(t.kind).as_str() != Some("thread_mill")) {
         let cutter = Cutter { diameter: mm(t.diameter), flutes: t.flutes as usize, flute_length: mm(t.flute_length) };
         if (1..=FLUTES.len()).contains(&cutter.flutes) && !k.cutters.iter().any(|c| c.same(&cutter)) && k.cutters.len() < 2 * MAX_CUTTERS {
             k.cutters.push(cutter);
@@ -200,7 +338,15 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
     // The part cut out last gives the plate, the cutter and, while they are still there, its sketches.
     let cam = &app.session.doc.cam;
     let last = cam.setup(SETUP).and_then(|s| s.operations.iter().rev().find(|op| matches!(op, CamOperation::Part { .. })));
-    if let Some(CamOperation::Part { tool, material, thickness, tier, hold, geometry, pockets, .. }) = last {
+    if let Some(CamOperation::Part { tool, material, thickness, tier, hold, geometry, pockets, threads, thread_tool, thread_fit, .. }) = last {
+        // Its threads, while their holes are still there (the holes are read as the rows are drawn).
+        k.threads = threads.iter().map(|t| (spot(t.at), t.thread.clone())).collect();
+        if let Some(t) = thread_tool.and_then(|n| cam.tool(n)).filter(|_| !threads.is_empty()) {
+            k.tm_diameter = mm(t.diameter);
+            k.tm_reach = mm(t.flute_length);
+            k.tm_flutes = FLUTES.iter().position(|f| f.parse::<u32>().is_ok_and(|n| n == t.flutes)).unwrap_or(k.tm_flutes);
+            k.tm_fit = thread_fit.as_str().to_owned();
+        }
         let drawn = |g: &CamGeometry| match g {
             CamGeometry::Sketch { sketch, .. } => sketches(app).iter().find(|s| s.0 == *sketch).map(|s| s.0),
             _ => None,
@@ -227,6 +373,8 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
     // The cutter in the fields is chosen by name where it is one of those offered.
     let typed = Cutter { diameter: k.diameter.clone(), flutes: k.flutes + 1, flute_length: k.flute_length.clone() };
     k.cutter = k.cutters.iter().position(|c| c.same(&typed)).unwrap_or(k.cutters.len());
+    let typed = k.typed_mill();
+    k.thread_mill = k.thread_mills.iter().position(|c| c.same(&typed)).unwrap_or(k.thread_mills.len());
     Some((Kind::CutOut(k), Vec::new()))
 }
 
@@ -242,6 +390,12 @@ pub fn remembered(old: &str, k: &CutOut) -> String {
     memory.hold = HOLDS.get(k.hold).map_or("", |h| h.0).to_owned();
     memory.thickness = k.thickness.trim().to_owned();
     memory.pocket_depth = k.pocket_depth.trim().to_owned();
+    if !k.threads.is_empty() {
+        let mill = k.typed_mill();
+        memory.thread_mills.retain(|c| !c.same(&mill));
+        memory.thread_mills.insert(0, mill);
+        memory.thread_mills.truncate(MAX_CUTTERS);
+    }
     serde_json::to_string(&memory).unwrap_or_default()
 }
 
@@ -267,6 +421,15 @@ fn params(k: &CutOut) -> Result<Value, String> {
     });
     if k.pocket_sketch != 0 && k.pocket_sketch != k.sketch {
         asked["pockets"] = json!([{"sketch": k.pocket_sketch, "depth": text(&k.pocket_depth, "Pocket depth")?}]);
+    }
+    // The holes given a thread, by their centres as `cam.holes` told them.
+    let threads: Vec<Value> = k.holes.iter().filter_map(|h| k.thread_of(h.at).map(|thread| json!({"at": h.at, "thread": thread}))).collect();
+    if !threads.is_empty() {
+        asked["threads"] = json!(threads);
+        asked["thread_mill_diameter"] = json!(text(&k.tm_diameter, "Thread mill diameter")?);
+        asked["thread_mill_flutes"] = json!(k.tm_flutes + 1);
+        asked["thread_mill_reach"] = json!(text(&k.tm_reach, "Thread mill reach")?);
+        asked["thread_fit"] = json!(text(&k.tm_fit, "Thread fit (+ looser)")?);
     }
     Ok(asked)
 }
@@ -365,6 +528,23 @@ fn lines(reply: &Value) -> Vec<String> {
     out
 }
 
+/// A plan's lines: the cuts' file, then the thread file's time, cuts and issues when it has one.
+fn report(reply: &Value) -> Vec<String> {
+    let mut out = lines(reply);
+    let thread = &reply["thread"];
+    if thread.is_object() {
+        let mut told = thread.clone();
+        told["operation"] = reply["operation"].clone();
+        let mut threads = lines(&told);
+        if let Some(first) = threads.first_mut() {
+            *first = format!("{}: {} min", solidcraft_ui_text::tr_label("Thread milling time"), number(&thread["readback"]["cut_minutes"]));
+        }
+        // The thread file's own extents are inside the cuts': its time, cuts and issues are told.
+        out.extend(threads.into_iter().enumerate().filter(|(i, _)| *i != 1 && *i != 2).map(|(_, line)| line));
+    }
+    out
+}
+
 /// Plan the cuts on a copy of the design: nothing is kept or written. The report's lines,
 /// whether the plan was refused, and its paths.
 fn check(app: &SolveApp, k: &CutOut) -> (Vec<String>, bool, Vec<Run>) {
@@ -376,7 +556,7 @@ fn check(app: &SolveApp, k: &CutOut) -> (Vec<String>, bool, Vec<Run>) {
     match planned {
         Ok(preview) => {
             let reply = preview.replies.first();
-            (reply.map(lines).unwrap_or_default(), false, reply.map(runs).unwrap_or_default())
+            (reply.map(report).unwrap_or_default(), false, reply.map(runs).unwrap_or_default())
         }
         Err(why) => (vec![why], true, Vec::new()),
     }
@@ -389,7 +569,8 @@ fn planned_for(app: &SolveApp, k: &CutOut) -> String {
         (
             app.session.revision,
             (k.sketch, k.pocket_sketch, &k.pocket_depth),
-            (k.material, &k.thickness, &k.diameter, k.flutes, &k.flute_length, k.tier, k.hold)
+            (k.material, &k.thickness, &k.diameter, k.flutes, &k.flute_length, k.tier, k.hold),
+            (&k.threads, &k.tm_diameter, k.tm_flutes, &k.tm_reach, &k.tm_fit)
         )
     )
 }
@@ -455,6 +636,63 @@ pub fn rows(app: &SolveApp, ui: &mut egui::Ui, k: &mut CutOut) -> bool {
         let labels: Vec<&str> = HOLDS.iter().map(|h| tr(h.1)).collect();
         combo(ui, "cut_out_hold", &labels, &mut k.hold);
     });
+    // The part's round holes, each with a thread to choose; read again when the outline's sketch
+    // or the design changes, and a thread whose hole is gone goes with it.
+    let holes_of = format!("{:?}", (app.session.revision, k.sketch));
+    if k.holes_of != holes_of {
+        (k.holes, k.thread_names) = holes(app, k.sketch);
+        k.holes_of = holes_of;
+        let there: Vec<[i64; 2]> = k.holes.iter().map(|h| spot(h.at)).collect();
+        k.threads.retain(|t| there.contains(&t.0));
+    }
+    if !k.holes.is_empty() && !k.thread_names.is_empty() {
+        crate::ui_kit::text(ui, tr("Threads in round holes"), crate::ui_kit::Text::Note("cut_out_threads"));
+        let listed: Vec<Hole> = k.holes.iter().take(MAX_HOLE_ROWS).cloned().collect();
+        for (i, hole) in listed.iter().enumerate() {
+            let label = format!("⌀{} · X{} Y{}", short(hole.diameter), short(hole.at[0]), short(hole.at[1]));
+            form_row(ui, &label, |ui| {
+                let labels: Vec<&str> = std::iter::once(tr("No thread")).chain(k.thread_names.iter().map(String::as_str)).collect();
+                let was = k.thread_of(hole.at).and_then(|name| k.thread_names.iter().position(|n| n == name)).map_or(0, |n| n + 1);
+                let mut at = was;
+                combo(ui, &format!("cut_out_thread_{i}"), &labels, &mut at);
+                if at != was {
+                    let name = at.checked_sub(1).and_then(|n| k.thread_names.get(n)).cloned().unwrap_or_default();
+                    k.set_thread(hole.at, &name);
+                }
+            });
+        }
+        if k.holes.len() > MAX_HOLE_ROWS {
+            let more = format!("+{} {}", k.holes.len() - MAX_HOLE_ROWS, tr("holes not listed"));
+            crate::ui_kit::text(ui, &more, crate::ui_kit::Text::Note("cut_out_more_holes"));
+        }
+    }
+    if !k.threads.is_empty() {
+        // A thread mill used before is chosen by name, with the fit it was used at; the last row is a new one.
+        if !k.thread_mills.is_empty() {
+            form_row(ui, "Thread mill", |ui| {
+                let names: Vec<String> = k.thread_mills.iter().map(ThreadCutter::label).collect();
+                let labels: Vec<&str> = names.iter().map(String::as_str).chain([tr("New thread mill…")]).collect();
+                let mut at = k.thread_mill.min(k.thread_mills.len());
+                combo(ui, "cut_out_thread_mill", &labels, &mut at);
+                if at != k.thread_mill {
+                    k.thread_mill = at;
+                    if let Some(c) = k.thread_mills.get(at) {
+                        k.tm_fit = c.fit.clone();
+                    }
+                }
+            });
+            if let Some(c) = k.thread_mills.get(k.thread_mill) {
+                (k.tm_diameter, k.tm_flutes, k.tm_reach) = (c.diameter.clone(), c.flutes.saturating_sub(1).min(FLUTES.len() - 1), c.reach.clone());
+            }
+        }
+        if k.thread_mill >= k.thread_mills.len() {
+            form_row(ui, "Thread mill diameter", |ui| enter |= field(ui, &mut k.tm_diameter));
+            form_row(ui, "Thread mill flutes", |ui| combo(ui, "cut_out_thread_mill_flutes", &FLUTES, &mut k.tm_flutes));
+            form_row(ui, "Thread mill reach", |ui| enter |= field(ui, &mut k.tm_reach));
+        }
+        form_row(ui, "Thread fit (+ looser)", |ui| enter |= field(ui, &mut k.tm_fit));
+        crate::ui_kit::text(ui, tr("cam.cut_out.thread_help"), crate::ui_kit::Text::Note("cut_out_thread_help"));
+    }
     // A changed value, or a changed design, makes the last plan another part's.
     let now = planned_for(app, k);
     if k.report_of != now {
@@ -494,16 +732,15 @@ pub fn run(app: &mut SolveApp, k: &CutOut) -> Result<(), String> {
         asked["path"] = json!(path);
         match app.run("cam.cut_out", asked) {
             Ok(reply) => {
-                let warnings = reply["issues"].as_array().map_or(0, Vec::len);
+                // With threads there are two files, the cuts' and the threads': both are told.
+                let both = [&reply, &reply["thread"]];
+                let warnings: usize = both.iter().map(|r| r["issues"].as_array().map_or(0, Vec::len)).sum();
+                let minutes: f64 = both.iter().filter_map(|r| r["readback"]["cut_minutes"].as_f64()).sum();
+                let files: Vec<&str> = both.iter().filter_map(|r| r["path"].as_str()).collect();
+                let files = if files.is_empty() { path.clone() } else { files.join(", ") };
                 let tr = solidcraft_ui_text::tr_label;
                 app.set_status(
-                    format!(
-                        "{}: {path} ({} {}, {warnings} {})",
-                        tr("G-code saved"),
-                        number(&reply["readback"]["cut_minutes"]),
-                        tr("min of cutting"),
-                        tr("warnings")
-                    ),
+                    format!("{}: {files} ({} {}, {warnings} {})", tr("G-code saved"), number(&json!(minutes)), tr("min of cutting"), tr("warnings")),
                     false,
                 );
             }
@@ -714,5 +951,129 @@ mod tests {
         assert!(h.app.dialog.as_ref().is_some_and(|d| d.error.as_deref().is_some_and(|e| e.contains("longer cutter"))));
         assert!(!asked.get(), "no file is asked for while the plan is refused");
         assert!(h.app.session.doc.cam.is_empty());
+    }
+
+    fn drilled_plate(h: &mut crate::scenario::Harness) {
+        h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        h.app.run("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]})).unwrap();
+        h.app.run("sketch.circle.center", json!({"center": [15, 20], "radius": 3.175})).unwrap();
+        h.app.run("sketch.circle.center", json!({"center": [45, 20], "radius": 3.175})).unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+    }
+
+    fn edit(h: &mut crate::scenario::Harness, change: impl FnOnce(&mut CutOut)) {
+        match h.app.dialog.as_mut().map(|d| &mut d.kind) {
+            Some(Kind::CutOut(k)) => change(k),
+            other => panic!("no Cut Out Part dialog: {other:?}"),
+        }
+        h.frames(2);
+    }
+
+    #[test]
+    fn the_dialog_lists_the_holes_and_saves_a_thread_file_beside_the_cuts() {
+        let mut h = crate::scenario::Harness::new();
+        drilled_plate(&mut h);
+        h.app.start("cam.cut_out");
+        h.frames(3);
+        // The part's round holes are listed, none threaded, with the threads to choose from.
+        let k = form(&h);
+        let mut at: Vec<[f64; 2]> = k.holes.iter().map(|hole| hole.at).collect();
+        at.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        assert_eq!(at, [[15.0, 20.0], [45.0, 20.0]]);
+        assert!(k.holes.iter().all(|hole| (hole.diameter - 6.35).abs() < 1e-9));
+        assert!(k.threads.is_empty() && k.thread_names.len() == 12 && k.thread_names.contains(&"1/4-20".to_string()), "{:?}", k.thread_names);
+        assert!(k.thread_mills.is_empty() && k.thread_mill == 0);
+
+        // One hole gets a 1/4-20 thread; Check lists the thread file after the cuts'.
+        edit(&mut h, |k| {
+            k.diameter = "3.175 mm".into();
+            k.flute_length = "17 mm".into();
+            k.set_thread([45.0, 20.0], "1/4-20");
+            (k.tm_diameter, k.tm_flutes, k.tm_reach, k.tm_fit) = ("4.572 mm".into(), 2, "12 mm".into(), "0.1 mm".into());
+        });
+        let design = h.app.session.doc.to_json();
+        h.step(&json!({"click":{"handle":"dialog:cut_out:check"}})).unwrap();
+        h.frames(2);
+        let k = form(&h);
+        assert!(!k.refused, "{:?}", k.report);
+        let line = |words: &[&str]| k.report.iter().position(|l| words.iter().all(|w| l.contains(w)));
+        let (time, cut) = (line(&["Thread milling time", "min"]).expect("its time"), line(&["Thread 1/4-20, 1 hole", "12000 rpm"]).expect("its cut"));
+        assert!(line(&["Outside finish"]).expect("the cuts") < time && time < cut, "{:?}", k.report);
+        assert!(line(&["Warning", "spoilboard"]).is_some_and(|i| i > cut), "{:?}", k.report);
+        assert_eq!(k.report.iter().filter(|l| l.starts_with("X ")).count(), 1, "the thread file's extents are not told again: {:?}", k.report);
+        // Its paths are drawn with the cuts': the thread mill goes 1.77 mm under the 6 mm plate, the bore 2.27 mm.
+        let low = k.paths.iter().flat_map(|r| &r.points).map(|p| p[2]).fold(f64::INFINITY, f64::min);
+        assert!((low + 8.27).abs() < 1e-6, "{low}");
+        assert_eq!(h.app.session.doc.to_json(), design, "Check keeps nothing");
+
+        // Save writes both files and keeps the part with its thread.
+        let dir = h.dir.clone();
+        h.app.services.pick_save =
+            Some(Box::new(move |_, _| Box::pin(std::future::ready(Some(dir.join("plate.nc").to_string_lossy().into_owned())))));
+        h.step(&json!({"click":{"handle":"dialog:Save G-code…"}})).unwrap();
+        wait_for_picker(&mut h);
+        assert!(h.app.dialog.is_none());
+        let cuts = std::fs::read_to_string(h.dir.join("plate-1-cut.nc")).unwrap();
+        let threads = std::fs::read_to_string(h.dir.join("plate-2-thread.nc")).unwrap();
+        assert!(cuts.contains("Z-8.27") && threads.contains("Z-7.77") && threads.contains("G3 ") && !h.dir.join("plate.nc").exists());
+        let cam = &h.app.session.doc.cam;
+        assert_eq!((cam.tools.len(), cam.setups[0].operations.len()), (2, 1));
+        // The thread mill is remembered with its fit.
+        let memory = Memory::read(&h.app.preferences.cut_out_memory);
+        assert_eq!(memory.thread_mills, [ThreadCutter { diameter: "4.572 mm".into(), flutes: 3, reach: "12 mm".into(), fit: "0.1 mm".into() }]);
+        assert_eq!(memory.cutters.len(), 1);
+
+        // Opened again, the dialog starts from the part's thread and thread mill, and does not
+        // offer the thread mill as a cutter to cut the part out with.
+        h.app.start("cam.cut_out");
+        h.frames(3);
+        let k = form(&h);
+        assert_eq!((k.thread_of([45.0, 20.0]), k.thread_of([15.0, 20.0])), (Some("1/4-20"), None));
+        assert_eq!((k.tm_diameter.as_str(), k.tm_flutes, k.tm_reach.as_str(), k.tm_fit.as_str()), ("4.572 mm", 2, "12 mm", "0.1 mm"));
+        assert_eq!((k.thread_mills.len(), k.thread_mill), (1, 0));
+        assert!(k.cutters.iter().all(|c| c.diameter != "4.572 mm"), "{:?}", k.cutters);
+        // A thread mill that does not fit the hole is refused in the dialog, and no file is asked for.
+        edit(&mut h, |k| {
+            k.thread_mill = k.thread_mills.len();
+            k.tm_diameter = "5 mm".into();
+        });
+        h.step(&json!({"click":{"handle":"dialog:cut_out:check"}})).unwrap();
+        h.frames(2);
+        let k = form(&h);
+        assert!(k.refused && k.report.iter().any(|l| l.contains("does not fit")), "{:?}", k.report);
+        // Its thread taken off, the part is one file's again and asks for no thread mill.
+        edit(&mut h, |k| k.set_thread([45.0, 20.0], ""));
+        h.step(&json!({"click":{"handle":"dialog:cut_out:check"}})).unwrap();
+        h.frames(2);
+        let k = form(&h);
+        assert!(!k.refused && !k.report.iter().any(|l| l.contains("Thread")), "{:?}", k.report);
+        h.step(&json!({"click":{"handle":"dialog:cancel"}})).unwrap();
+
+        // A hole that is moved in the sketch loses its thread in the dialog: there is no hole there.
+        // In another design the thread mill is offered by name, with the fit it was used at.
+        let mut other = crate::scenario::Harness::new();
+        other.app.load_prefs(&h.app.prefs());
+        drilled_plate(&mut other);
+        other.app.start("cam.cut_out");
+        other.frames(3);
+        edit(&mut other, |k| {
+            k.set_thread([15.0, 20.0], "M6");
+            k.set_thread([99.0, 99.0], "M6");
+        });
+        let k = form(&other);
+        assert_eq!(k.thread_mills.iter().map(ThreadCutter::label).collect::<Vec<_>>(), ["4.572 mm · 3F · 12 mm"]);
+        assert_eq!(
+            (k.thread_mill, k.tm_diameter.as_str(), k.tm_flutes, k.tm_reach.as_str(), k.tm_fit.as_str()),
+            (0, "4.572 mm", 2, "12 mm", "0.1 mm")
+        );
+        assert!(
+            Memory::read(r#"{"thread_mills":[{"diameter":"","flutes":9,"reach":""}]}"#).thread_mills.is_empty()
+                && Memory::read("not a memory").thread_mills.is_empty()
+        );
+        // Only the hole that is there is asked to be threaded.
+        other.step(&json!({"click":{"handle":"dialog:cut_out:check"}})).unwrap();
+        other.frames(2);
+        let k = form(&other);
+        assert!(!k.refused && k.report.iter().any(|l| l.contains("Thread M6, 1 hole")), "{:?}", k.report);
     }
 }
