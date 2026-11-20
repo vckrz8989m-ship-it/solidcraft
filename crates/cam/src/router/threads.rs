@@ -24,7 +24,7 @@ const fn unified(name: &'static str, major: f64, per_inch: f64) -> Thread {
 }
 
 /// The threads offered, unified then metric (coarse pitches).
-pub const THREADS: [Thread; 12] = [
+pub const THREADS: &[Thread] = &[
     unified("10-24", 4.826, 24.0),
     unified("10-32", 4.826, 32.0),
     unified("1/4-20", 6.35, 20.0),
