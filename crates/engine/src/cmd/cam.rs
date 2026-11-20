@@ -1045,8 +1045,12 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     let (thread_issues, issues): (Vec<Issue>, Vec<Issue>) =
         plan.issues.into_iter().partition(|i| i.at.as_deref().is_some_and(|at| thread_ops.iter().any(|o| o.name == at)));
     let program = Program { name: name.clone(), operations: cut_ops, work_offset: Some(setup.work_offset) };
-    let threading =
-        (!thread_ops.is_empty()).then(|| Program { name: format!("{name} threads"), operations: thread_ops, work_offset: Some(setup.work_offset) });
+    // Its name is the file's first line (a comment of at most 80 characters): what must have run before it.
+    let threading = (!thread_ops.is_empty()).then(|| Program {
+        name: format!("{name} threads: run after the cut file"),
+        operations: thread_ops,
+        work_offset: Some(setup.work_offset),
+    });
     // The paths in the model, for a front end to draw over the part.
     let paths = if with_paths {
         let frame = work_frame(&setup).map_err(|e| bad(cmd, e))?;
@@ -1090,9 +1094,11 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         None => None,
     };
     let mut written: Vec<(String, String)> = Vec::new();
-    if let Some(base) = base {
+    if let Some(chosen) = base {
+        // A file of the pair chosen again is that pair, not a pair named after it.
+        let base = if thread_out.is_some() { untagged_path(chosen, &["-1-cut", "-2-thread"]) } else { chosen.to_string() };
         let mut file = |reply: &mut Value, tag: &str| -> Result<()> {
-            let file = if tag.is_empty() { base.to_string() } else { tagged_path(base, tag) };
+            let file = if tag.is_empty() { base.clone() } else { tagged_path(&base, tag) };
             solidcraft_io::vfs::check(&file).map_err(|e| crate::EngineError::Other(e.to_string()))?;
             written.push((file.clone(), reply["gcode"].as_str().unwrap_or_default().to_string()));
             reply["path"] = json!(file);
@@ -1104,6 +1110,28 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
                 file(reply, "-2-thread")?;
             }
             None => file(&mut out, "")?,
+        }
+        // A program of the part's other kind left beside these would be run with the wrong
+        // companion: a thread file in holes this program does not bore, or the reverse. It is
+        // said; nothing is deleted.
+        let stale: Vec<String> = match thread_out {
+            Some(_) => vec![base.clone()],
+            None => vec![tagged_path(&base, "-1-cut"), tagged_path(&base, "-2-thread")],
+        };
+        for old in stale.iter().filter(|f| solidcraft_io::vfs::exists(f) && !written.iter().any(|(w, _)| w == *f)) {
+            let file = std::path::Path::new(old).file_name().map_or_else(|| old.clone(), |n| n.to_string_lossy().into_owned());
+            let issue = Issue {
+                severity: Severity::Warning,
+                at: Some(name.clone()),
+                message: format!(
+                    "{file} is beside {}: an older program of this part {} threads, which does not go with what is written now. Delete it",
+                    if thread_out.is_some() { "these files" } else { "this file" },
+                    if thread_out.is_some() { "without" } else { "with" }
+                ),
+            };
+            if let Some(list) = out["issues"].as_array_mut() {
+                list.push(json!(issue));
+            }
         }
     }
     for (file, gcode) in &written {
@@ -1182,6 +1210,18 @@ fn cutter_param(s: &Session, cmd: &str, p: &Value, prefix: &str, number: u32, ki
     tool.description = format!("{d} mm {shape} end mill, {flutes} flute{}", if flutes == 1 { "" } else { "s" });
     tool.validate().map_err(|e| bad(cmd, e.to_string()))?;
     Ok(Some(tool))
+}
+
+/// `path` without one of `tags` at the end of its name: `part-1-cut.nc` gives `part.nc`.
+fn untagged_path(path: &str, tags: &[&str]) -> String {
+    let p = std::path::Path::new(path);
+    let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { return path.to_string() };
+    let Some(bare) = tags.iter().find_map(|tag| stem.strip_suffix(tag)).filter(|bare| !bare.is_empty()) else { return path.to_string() };
+    let name = match p.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{bare}.{ext}"),
+        None => bare.to_string(),
+    };
+    p.with_file_name(name).to_string_lossy().into_owned()
 }
 
 /// `path` with `tag` put before its extension: `part.nc` and `-1-rough` give `part-1-rough.nc`.
@@ -2281,16 +2321,23 @@ mod tests {
             // The extents are of the path's chords, 0.05 mm off its arcs at most.
             assert!((got.as_f64().unwrap() - want).abs() < 0.051, "{got} is not {want}: {}", thread["extents"]);
         }
-        assert!(
-            thread["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("spoilboard"))),
-            "{}",
-            thread["issues"]
-        );
-        assert!(
-            !out["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("spoilboard"))),
-            "{}",
-            out["issues"]
-        );
+        // Each program is told what it does below the plate: the cutter's that it bores the hole at
+        // the thread's size and into the spoilboard, the thread mill's how far it goes.
+        let said = |reply: &Value, words: &[&str]| {
+            reply["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| words.iter().all(|w| m.contains(w))))
+        };
+        assert!(said(&out, &["⌀5.08 mm", "2.27 mm below the plate", "spoilboard"]), "{}", out["issues"]);
+        assert!(said(thread, &["thread mill goes 1.77 mm below the plate"]) && !said(thread, &["spoilboard"]), "{}", thread["issues"]);
+        // The thread file says in its first line what must have run before it.
+        assert!(thread_text.lines().next().is_some_and(|l| l.contains("threads") && l.contains("run after the cut file")), "{thread_text}");
+        // The crossing from hole to hole and every other rapid sideways is at the 5 mm clearance.
+        let mut z = f64::NAN;
+        for line in thread_text.lines().filter(|l| l.starts_with("G0 ")) {
+            if let Some(word) = line.split(' ').find(|w| w.starts_with('Z')) {
+                z = word[1..].parse().unwrap();
+            }
+            assert!(!(line.contains(" X") || line.contains(" Y")) || z.is_nan() || z >= 5.0 - 1e-9, "a rapid sideways at Z{z}: {line}");
+        }
         // The paths to draw are both programs', the thread's last.
         let paths = out["paths"].as_array().unwrap();
         assert_eq!(paths.len(), 7);
@@ -2323,11 +2370,11 @@ mod tests {
         let posted = run(&mut s, "cam.post", json!({"setup": "Router", "tool": 1}));
         let text = posted["gcode"].as_str().unwrap();
         assert!(text.contains("Outside finish") && text.contains("Z-8.27") && !text.contains("Thread") && !text.lines().any(|l| l == "M0"), "{text}");
-        assert!(!posted["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("spoilboard"))));
+        assert!(posted["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("spoilboard"))));
         let posted = run(&mut s, "cam.post", json!({"setup": "Router", "tool": 2}));
         let text = posted["gcode"].as_str().unwrap();
         assert!(text.contains("Thread 1/4-20") && !text.contains("Outside") && !text.lines().any(|l| l == "M0"), "{text}");
-        assert!(posted["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("spoilboard"))));
+        assert!(posted["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("thread mill goes"))));
         assert_eq!(posted["operations"].as_u64(), Some(1));
         for (tool, why) in [(json!(9), "is cut with tool 9"), (json!("x"), "`tool` must be"), (json!(1.5), "`tool` must be")] {
             let e = s.execute("cam.post", &json!({"setup": "Router", "tool": tool})).unwrap_err().to_string();
@@ -2342,6 +2389,25 @@ mod tests {
         );
         assert_eq!(part["cuts"].as_array().unwrap().last().and_then(Value::as_str), Some("Again: Thread M6, 1 hole"), "{part}");
         run(&mut s, "cam.op.remove", json!({"setup": "Router", "name": "Again"}));
+
+        // A file chosen by one of the two names is the same pair, not a third and a fourth file.
+        for chosen in ["plate-1-cut.nc", "plate-2-thread.nc"] {
+            let mut same = with_path.clone();
+            same["path"] = json!(dir.join(chosen).to_string_lossy());
+            let again = run(&mut s, "cam.cut_out", same);
+            assert!(
+                again["path"].as_str().unwrap().ends_with("plate-1-cut.nc")
+                    && again["thread"]["path"].as_str().unwrap().ends_with("plate-2-thread.nc")
+            );
+            assert_eq!(files(&dir), ["plate-1-cut.nc", "plate-2-thread.nc"], "{chosen}");
+        }
+        // An older one-file program of the part beside them is said: it bores no hole for a thread.
+        std::fs::write(dir.join("plate.nc"), "(old)").unwrap();
+        let beside = run(&mut s, "cam.cut_out", with_path.clone());
+        assert!(said(&beside, &["plate.nc", "older program"]), "{}", beside["issues"]);
+        assert_eq!(std::fs::read_to_string(dir.join("plate.nc")).unwrap(), "(old)", "it is said, not deleted");
+        std::fs::remove_file(dir.join("plate.nc")).unwrap();
+        assert!(!said(&run(&mut s, "cam.cut_out", with_path.clone()), &["older program"]));
 
         // What cannot be threaded as asked is refused before anything is written or kept.
         let before = s.doc.cam.clone();
@@ -2382,9 +2448,16 @@ mod tests {
         // Without threads asked again the part is kept without them, in one file under its own name.
         let mut plain = json!({"sketch": sketch, "material": "aluminum", "thickness": 6, "tool": 1});
         plain["path"] = json!(dir.join("plain.nc").to_string_lossy());
-        let out = run(&mut s, "cam.cut_out", plain);
+        let out = run(&mut s, "cam.cut_out", plain.clone());
         assert!(out["thread"].is_null() && out["path"].as_str().unwrap().ends_with("plain.nc") && dir.join("plain.nc").exists());
         assert!(!std::fs::read_to_string(dir.join("plain.nc")).unwrap().contains("Z-8.27"));
+        assert!(!said(&out, &["older program"]), "{}", out["issues"]);
+        // Written under the name the threaded pair has, the pair left beside it is said: its thread
+        // file would mill in holes this program does not bore.
+        plain["path"] = json!(dir.join("plate.nc").to_string_lossy());
+        let out = run(&mut s, "cam.cut_out", plain);
+        assert!(said(&out, &["plate-2-thread.nc", "older program"]), "{}", out["issues"]);
+        assert!(dir.join("plate-2-thread.nc").exists());
         let kept = run(&mut s, "cam.list", json!({}));
         assert_eq!((&kept["setups"][0]["operations"][0]["threads"], &kept["setups"][0]["operations"][0]["thread_tool"]), (&json!([]), &Value::Null));
         // A thread mill can be defined as a tool of its own.

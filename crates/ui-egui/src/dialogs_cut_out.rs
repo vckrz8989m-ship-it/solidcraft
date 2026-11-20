@@ -422,8 +422,17 @@ fn params(k: &CutOut) -> Result<Value, String> {
     if k.pocket_sketch != 0 && k.pocket_sketch != k.sketch {
         asked["pockets"] = json!([{"sketch": k.pocket_sketch, "depth": text(&k.pocket_depth, "Pocket depth")?}]);
     }
-    // The holes given a thread, by their centres as `cam.holes` told them.
-    let threads: Vec<Value> = k.holes.iter().filter_map(|h| k.thread_of(h.at).map(|thread| json!({"at": h.at, "thread": thread}))).collect();
+    // The threads chosen, each by its hole's centre as `cam.holes` told it. One whose hole is
+    // not there now is asked for all the same, so that the plan says so and is refused: a
+    // thread is never dropped without a word.
+    let threads: Vec<Value> = k
+        .threads
+        .iter()
+        .map(|(spot_of, thread)| {
+            let at = k.holes.iter().find(|h| spot(h.at) == *spot_of).map_or([spot_of[0] as f64 / 1000.0, spot_of[1] as f64 / 1000.0], |h| h.at);
+            json!({"at": at, "thread": thread})
+        })
+        .collect();
     if !threads.is_empty() {
         asked["threads"] = json!(threads);
         asked["thread_mill_diameter"] = json!(text(&k.tm_diameter, "Thread mill diameter")?);
@@ -637,13 +646,11 @@ pub fn rows(app: &SolveApp, ui: &mut egui::Ui, k: &mut CutOut) -> bool {
         combo(ui, "cut_out_hold", &labels, &mut k.hold);
     });
     // The part's round holes, each with a thread to choose; read again when the outline's sketch
-    // or the design changes, and a thread whose hole is gone goes with it.
+    // or the design changes. A thread whose hole is gone is kept and shown, never dropped.
     let holes_of = format!("{:?}", (app.session.revision, k.sketch));
     if k.holes_of != holes_of {
         (k.holes, k.thread_names) = holes(app, k.sketch);
         k.holes_of = holes_of;
-        let there: Vec<[i64; 2]> = k.holes.iter().map(|h| spot(h.at)).collect();
-        k.threads.retain(|t| there.contains(&t.0));
     }
     if !k.holes.is_empty() && !k.thread_names.is_empty() {
         crate::ui_kit::text(ui, tr("Threads in round holes"), crate::ui_kit::Text::Note("cut_out_threads"));
@@ -664,6 +671,24 @@ pub fn rows(app: &SolveApp, ui: &mut egui::Ui, k: &mut CutOut) -> bool {
         if k.holes.len() > MAX_HOLE_ROWS {
             let more = format!("+{} {}", k.holes.len() - MAX_HOLE_ROWS, tr("holes not listed"));
             crate::ui_kit::text(ui, &more, crate::ui_kit::Text::Note("cut_out_more_holes"));
+        }
+    }
+    // Threads chosen where no round hole is now (the hole was moved or deleted, or another sketch
+    // is the outline): each is shown, to be taken off, and the plan is refused while one is left.
+    let there: Vec<[i64; 2]> = k.holes.iter().map(|h| spot(h.at)).collect();
+    let stale: Vec<([i64; 2], String)> = k.threads.iter().filter(|t| !there.contains(&t.0)).cloned().collect();
+    if !stale.is_empty() {
+        crate::ui_kit::text(ui, tr("cam.cut_out.thread_stale"), crate::ui_kit::Text::Error("cut_out_thread_stale"));
+        for (i, (spot_of, name)) in stale.iter().take(MAX_HOLE_ROWS).enumerate() {
+            let at = [spot_of[0] as f64 / 1000.0, spot_of[1] as f64 / 1000.0];
+            form_row(ui, &format!("X{} Y{}", short(at[0]), short(at[1])), |ui| {
+                let labels = [tr("No thread"), name.as_str()];
+                let mut chosen = 1;
+                combo(ui, &format!("cut_out_stale_thread_{i}"), &labels, &mut chosen);
+                if chosen == 0 {
+                    k.set_thread(at, "");
+                }
+            });
         }
     }
     if !k.threads.is_empty() {
@@ -999,7 +1024,9 @@ mod tests {
         let line = |words: &[&str]| k.report.iter().position(|l| words.iter().all(|w| l.contains(w)));
         let (time, cut) = (line(&["Thread milling time", "min"]).expect("its time"), line(&["Thread 1/4-20, 1 hole", "12000 rpm"]).expect("its cut"));
         assert!(line(&["Outside finish"]).expect("the cuts") < time && time < cut, "{:?}", k.report);
-        assert!(line(&["Warning", "spoilboard"]).is_some_and(|i| i > cut), "{:?}", k.report);
+        // What the cutter does for the thread is told with its cuts, what the thread mill does with its own.
+        assert!(line(&["Warning", "⌀5.08 mm", "spoilboard"]).is_some_and(|i| i < time), "{:?}", k.report);
+        assert!(line(&["Warning", "thread mill goes 1.77 mm below the plate"]).is_some_and(|i| i > cut), "{:?}", k.report);
         assert_eq!(k.report.iter().filter(|l| l.starts_with("X ")).count(), 1, "the thread file's extents are not told again: {:?}", k.report);
         // Its paths are drawn with the cuts': the thread mill goes 1.77 mm under the 6 mm plate, the bore 2.27 mm.
         let low = k.paths.iter().flat_map(|r| &r.points).map(|p| p[2]).fold(f64::INFINITY, f64::min);
@@ -1049,7 +1076,6 @@ mod tests {
         assert!(!k.refused && !k.report.iter().any(|l| l.contains("Thread")), "{:?}", k.report);
         h.step(&json!({"click":{"handle":"dialog:cancel"}})).unwrap();
 
-        // A hole that is moved in the sketch loses its thread in the dialog: there is no hole there.
         // In another design the thread mill is offered by name, with the fit it was used at.
         let mut other = crate::scenario::Harness::new();
         other.app.load_prefs(&h.app.prefs());
@@ -1070,7 +1096,26 @@ mod tests {
             Memory::read(r#"{"thread_mills":[{"diameter":"","flutes":9,"reach":""}]}"#).thread_mills.is_empty()
                 && Memory::read("not a memory").thread_mills.is_empty()
         );
-        // Only the hole that is there is asked to be threaded.
+        // A thread whose hole is not there (the hole was moved or deleted in the sketch) is never
+        // dropped silently: it stays in the dialog, and the plan is refused until it is taken off.
+        other.step(&json!({"click":{"handle":"dialog:cut_out:check"}})).unwrap();
+        other.frames(2);
+        let k = form(&other);
+        assert!(k.refused && k.report.iter().any(|l| l.contains("no round hole") && l.contains("X 99")), "{:?}", k.report);
+        assert_eq!((k.thread_of([99.0, 99.0]), k.thread_of([15.0, 20.0])), (Some("M6"), Some("M6")));
+        // Nor is a choice lost by looking at another sketch and coming back, or by a change to the design.
+        let outline = k.sketch;
+        edit(&mut other, |k| k.sketch = 0);
+        edit(&mut other, |k| k.sketch = outline);
+        other.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        other.app.run("sketch.circle.center", json!({"center": [200, 200], "radius": 2})).unwrap();
+        other.app.run("sketch.finish", json!({})).unwrap();
+        other.frames(3);
+        edit(&mut other, |k| k.sketch = outline);
+        let k = form(&other);
+        assert_eq!((k.thread_of([99.0, 99.0]), k.thread_of([15.0, 20.0]), k.holes.len()), (Some("M6"), Some("M6"), 2));
+        // Taken off, the hole that is there is threaded.
+        edit(&mut other, |k| k.set_thread([99.0, 99.0], ""));
         other.step(&json!({"click":{"handle":"dialog:cut_out:check"}})).unwrap();
         other.frames(2);
         let k = form(&other);

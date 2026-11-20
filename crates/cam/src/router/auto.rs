@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use solidcore_record::{Loop2, Region2, Seg2, Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 
-use crate::helical::{ThreadParams, thread_mill};
+use crate::helical::{CHIP_ROOM_RATIO, ThreadParams, thread_mill};
 use crate::router::feeds::{CutKind, FeedRequest, Material, Recipe, Tier, recipe};
 use crate::router::threads::{FIT_RANGE, Thread, mm, thread_feed};
 use crate::router::{Issue, MachineProfile};
@@ -310,12 +310,38 @@ pub fn round_holes(regions: &[Region2]) -> Result<Vec<RoundHole>> {
     Ok(out)
 }
 
-/// An opening that is given a thread: which it is, its centre as drawn, and the thread.
+/// An opening that is given a thread: which it is, its centre and diameter as drawn, and the
+/// thread.
 struct Tapped {
     part: usize,
     hole: usize,
     center: Vec2,
+    drawn: f64,
     thread: Thread,
+}
+
+/// Points round a hole's wall that are looked at to see what a wider hole would cut into.
+const WALL_SAMPLES: usize = 72;
+
+/// A part's outline and openings as polygons, made once for the holes bored wider than drawn.
+struct Walls {
+    outline: solidcraft_geom::Ring<Vec2>,
+    openings: Vec<solidcraft_geom::Ring<Vec2>>,
+}
+
+impl Walls {
+    fn of(region: &Region2) -> Walls {
+        Walls { outline: region.outer.polyline(1e-3), openings: region.holes.iter().map(|h| h.polyline(1e-3)).collect() }
+    }
+
+    /// Whether a hole of `diameter` about `center` stays in the part and out of its openings
+    /// other than opening `own`: looked at round the hole's wall.
+    fn hold(&self, own: usize, center: Vec2, diameter: f64) -> bool {
+        (0..WALL_SAMPLES).all(|k| {
+            let p = center + Vec2::from_angle(std::f64::consts::TAU * k as f64 / WALL_SAMPLES as f64) * (0.5 * diameter);
+            self.outline.contains(p) && !self.openings.iter().enumerate().any(|(j, other)| j != own && other.contains(p))
+        })
+    }
 }
 
 /// [`plan_part_with`] with `threading`: its holes are bored to their threads' size, and the
@@ -385,9 +411,9 @@ pub fn plan_part_threaded(
                     .holes
                     .iter()
                     .enumerate()
-                    .find_map(|(j, lp)| full_circle(lp).filter(|(c, _)| c.dist(asked.center) <= HOLE_TOLERANCE).map(|(c, _)| (i, j, c)))
+                    .find_map(|(j, lp)| full_circle(lp).filter(|(c, _)| c.dist(asked.center) <= HOLE_TOLERANCE).map(|(c, r)| (i, j, c, 2.0 * r)))
             });
-            let Some((part, hole, center)) = found else {
+            let Some((part, hole, center, drawn)) = found else {
                 plan.issues.push(Issue::error(
                     None,
                     format!(
@@ -402,17 +428,36 @@ pub fn plan_part_threaded(
             if tapped.iter().any(|h| h.part == part && h.hole == hole) {
                 return invalid(format!("two threads are given for the hole at X {} Y {}", mm(center.x), mm(center.y)));
             }
-            tapped.push(Tapped { part, hole, center, thread: asked.thread });
+            tapped.push(Tapped { part, hole, center, drawn, thread: asked.thread });
         }
-        for Tapped { thread, .. } in &tapped {
+        let mut walls: Vec<Option<Walls>> = parts.iter().map(|_| None).collect();
+        for Tapped { part, hole, center, drawn, thread } in &tapped {
             let (bored, reach) = (cut.thickness + thread.bored_below(), cut.thickness + thread.below());
-            let stop = if !(d < thread.bore()) {
+            // A hole bored wider than it was drawn cuts where nothing was drawn to be cut.
+            let wider = thread.bore() > drawn + 2.0 * HOLE_TOLERANCE;
+            let holds = !wider
+                || match (walls.get_mut(*part), parts.get(*part)) {
+                    (Some(slot), Some(region)) => slot.get_or_insert_with(|| Walls::of(region)).hold(*hole, *center, thread.bore()),
+                    _ => false,
+                };
+            let stop = if !holds {
                 Some(format!(
-                    "the {} mm cutter does not fit the ⌀{} mm hole of a {} thread: use a cutter under {} mm, or take the thread off the hole",
+                    "the ⌀{} mm hole of a {} thread at X {} Y {} is wider than the ⌀{} mm hole drawn there, and would cut through the part's \
+                     edge or into another opening: choose the thread for another hole, or move the hole",
+                    mm(thread.bore()),
+                    thread.name,
+                    mm(center.x),
+                    mm(center.y),
+                    mm(*drawn)
+                ))
+            } else if !(d <= thread.widest_cutter()) {
+                Some(format!(
+                    "the {} mm cutter does not fit the ⌀{} mm hole of a {} thread with room for its chips: use a cutter of at most {} mm, or \
+                     take the thread off the hole",
                     mm(d),
                     mm(thread.bore()),
                     thread.name,
-                    mm(thread.bore())
+                    mm(thread.widest_cutter())
                 ))
             } else if bored > tool.flute_length {
                 Some(format!(
@@ -609,11 +654,13 @@ pub fn plan_part_threaded(
             }
             let feed = thread_feed(&thread, t.fit, &t.tool, cut.material, cut.tier, machine)?;
             let (across, rise) = (thread.major + t.fit, 0.5 * thread.pitch);
-            // The thread starts half a pitch above the plate and runs out below it.
-            let retract = cut.retract.max(rise + 0.5);
+            // The thread starts half a pitch above the plate and runs out below it. From hole to
+            // hole the thread mill crosses the plate at the clearance height, as every other cut
+            // travels: over a clamp or a screw head, not just above the plate.
+            let travel = cut.clearance.max(rise + 0.5);
             let heights = Heights {
-                clearance: cut.top + cut.clearance.max(retract),
-                retract: cut.top + retract,
+                clearance: cut.top + travel,
+                retract: cut.top + travel,
                 top: cut.top + rise,
                 bottom: cut.top - cut.thickness - thread.below(),
             };
@@ -635,15 +682,39 @@ pub fn plan_part_threaded(
             for w in milled.warnings {
                 plan.issues.push(Issue::warning(Some(name.clone()), w));
             }
+            // What the cutter does for the thread is said of the part (its own program is told);
+            // what the thread mill does, of the thread operation.
+            let below = thread.bored_below().max(cut.break_through);
+            plan.issues.push(Issue::warning(
+                None,
+                format!(
+                    "{} bored ⌀{} mm whatever was drawn, and {} mm below the plate, into the spoilboard, for the thread to run out of the bottom",
+                    if n == 1 {
+                        format!("the hole of the {} thread is", thread.name)
+                    } else {
+                        format!("the {n} holes of the {} threads are", thread.name)
+                    },
+                    mm(thread.bore()),
+                    mm(below)
+                ),
+            ));
+            if thread.bore() < CHIP_ROOM_RATIO * d {
+                plan.issues.push(Issue::warning(
+                    None,
+                    format!(
+                        "the {} mm cutter has little room for chips in the ⌀{} mm hole of a {} thread: clear them with air, or use a smaller cutter",
+                        mm(d),
+                        mm(thread.bore()),
+                        thread.name
+                    ),
+                ));
+            }
             plan.issues.push(Issue::warning(
                 Some(name.clone()),
                 format!(
-                    "{} bored ⌀{} mm whatever was drawn, and {} mm below the plate, into the spoilboard, for the thread to run out of the \
-                     bottom: the thread mill goes {} mm below it",
-                    if n == 1 { "the hole is" } else { "the holes are" },
-                    mm(thread.bore()),
-                    mm(thread.bored_below().max(cut.break_through)),
-                    mm(thread.below())
+                    "the thread mill goes {} mm below the plate, in holes the cutter's program bores {} mm below it: run it only after that program",
+                    mm(thread.below()),
+                    mm(below)
                 ),
             ));
             plan.operations.push(Operation { name, tool: t.tool.clone(), spindle_rpm: feed.rpm, coolant: cut.coolant, path: milled.path });

@@ -114,7 +114,12 @@ How it works:
 - Through threads only. The thread mill's tip goes a pitch and 0.5 mm below the plate so the
   thread runs out of the bottom, and starts half a pitch above the top. The end mill
   therefore bores a threaded hole a pitch and 1 mm below the plate (into the spoilboard), so
-  the thread mill's end never meets uncut material; the plan says how deep.
+  the thread mill's end never meets uncut material; the plan says so of the part (the
+  cutter's program is told it), with the bore size. From hole to hole the thread mill travels
+  at the part's clearance height.
+- The end mill must be at least 0.5 mm smaller than the bore, for its chips; under 1.2 cutter
+  diameters of bore the plan warns of little room. A bore wider than the hole drawn must stay
+  inside the part and out of its other openings, or the plan stops.
 - The thread is cut by `helical::thread_mill` (upstream): internal, right-hand, climb, from
   the bottom up, one pitch a turn, in two radial passes in metals when the pitch is 1 mm or
   less and three above it (one and two in plastics and wood, one more on the careful tier),
@@ -129,19 +134,28 @@ How it works:
 - `cam.cut_out` with threads writes two files, `-1-cut` and `-2-thread` before the extension,
   both checked before either is written; its reply gains `thread` (the second program as
   the first is told) and the saved part keeps `threads`, `thread_tool` and `thread_fit`.
+  A file of the pair chosen again is that pair. The thread file's first line says it runs
+  after the cut file. A program of the part's other kind left beside the files written (the
+  one file of a part without threads, or the pair) is warned of, never deleted.
   `cam.holes` lists a part's round openings (name, centre, diameter) for a front end.
   `cam.post` of a setup whose part has threads refuses to write both cutters' work as one
   program (a stop in a program gives no way to zero the thread mill): it is asked a cutter
   at a time, with `tool`.
 - Cut Out Part lists the round holes with a thread choice each; once one is chosen it asks for
   the thread mill (remembered ones by name) and the fit. Check lists the thread file's time
-  and cuts after the first file's.
+  and cuts after the first file's. A thread chosen where no round hole is now (the hole was
+  moved or deleted) stays in the dialog, shown as such, and the plan is refused until it is
+  taken off: the dialog never drops a thread without a word.
 
 Left to the builder: wording of messages, the row layout in the dialog.
 
 Limits to state: the part is on its holding tabs while it is threaded; the tooth is taken to
 be at the thread mill's tip; threads smaller than 10-24 are not offered; feeds and the bore
-size are untested on the machine, so the first thread is a test hole in scrap.
+size are untested on the machine, so the first thread is a test hole in scrap. A thread is
+kept by its hole's centre: a row of equal holes moved by exactly one spacing, or a moved work
+origin, puts the saved threads on other holes without a stop. The 0.5 mm between the thread
+mill's tip and the bore's floor assumes a flat end mill bored it. The feed is set for the
+last radial pass; on the first passes the edge moves up to about two thirds faster.
 
 Built on 2026-11-19 (branch `router-layer`), and how far it is tested: the planner's tests
 (`router_tests.rs`: the table, the feeds, a threaded hole bored and milled, refusals and
@@ -152,8 +166,12 @@ crates' test modules have not been run). A demo plate (80 x 50 x 6.35 mm, two 1/
 and one 10-32 with a 3.429 mm thread mill) was written as its two files: the router skill's
 `gcode_check.py` reports 0 errors on both (thread file: 295 lines, about 4 minutes). Not done
 yet: grblHAL's check mode on the laptop's simulator, a Windows build with this in it, and any
-cut. Not checked by the planner: that a hole bored larger than it was drawn still lies inside
-the part and clear of its other openings.
+cut. An independent review on 2026-11-19 found the dialog dropping a thread whose hole had
+moved, the thread mill crossing the plate 1 mm above it, stale files beside new ones, the
+spoilboard warning told only to the thread program, a panic on a very slow machine profile
+and no chip room asked of the end mill: all fixed the same day, each with a test seen failing
+first. Both demo files then went through grblHAL's own check mode in the laptop's simulator:
+no line refused. The fork's "Router CAM tests" workflow runs the crates' own tests on GitHub.
 
 ## Scope
 

@@ -47,6 +47,9 @@ const SURFACE_SPEED: f64 = 120.0;
 const CHIP_PER_DIAMETER: f64 = 0.004;
 /// Feed down the bored hole to the thread's start (mm/min).
 const PLUNGE: f64 = 300.0;
+/// How much smaller than the hole the end mill that bores it must be (mm): room for its chips
+/// on the way down.
+pub const BORE_ROOM: f64 = 0.5;
 /// Room a thread mill needs between it and the hole's wall on each side (mm).
 pub const WALL_GAP: f64 = crate::helical::MIN_WALL_GAP;
 
@@ -79,6 +82,11 @@ impl Thread {
     /// How far below the plate the hole is bored (mm): 0.5 mm under the thread mill's tip.
     pub fn bored_below(&self) -> f64 {
         self.pitch + 1.0
+    }
+
+    /// The widest end mill that bores the hole with room for its chips (mm).
+    pub fn widest_cutter(&self) -> f64 {
+        self.bore() - BORE_ROOM
     }
 
     /// The largest thread mill that goes down the hole with room (mm).
@@ -131,7 +139,8 @@ pub fn thread_feed(thread: &Thread, fit: f64, tool: &Tool, material: Material, t
     let edge = rpm * f64::from(tool.flutes) * CHIP_PER_DIAMETER * tool.diameter * share;
     let across = thread.major + fit;
     let centre = edge * (across - tool.diameter) / across;
-    let feed = ((centre / 5.0).round() * 5.0).clamp(10.0, machine.max_feed);
+    // Not `clamp`: a machine slower than 10 mm/min is a valid profile, and its feed is held to.
+    let feed = ((centre / 5.0).round() * 5.0).max(10.0).min(machine.max_feed);
     let metal = matches!(material, Material::Aluminum | Material::AluminumSoft | Material::Brass);
     let radial_passes = u32::from(metal) + u32::from(thread.pitch > 1.0) + u32::from(tier == Tier::Careful) + 1;
     Ok(ThreadFeed { rpm, feed, plunge: PLUNGE.min(machine.max_feed), radial_passes, spring_pass: true })

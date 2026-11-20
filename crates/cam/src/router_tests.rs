@@ -592,6 +592,25 @@ fn the_thread_table_bores_each_thread_at_its_tap_drill_size() {
     assert_eq!(find("M10 x 1.5").map(|t| t.name), Some("M10"));
     assert!(find("M7").is_none() && find("").is_none() && find("1/4").is_none() && find("M6x0.75").is_none());
     assert_eq!(THREADS.len(), 12);
+    // Every size by its numbers: major diameter and pitch (mm).
+    let table: Vec<(&str, f64, f64)> = THREADS.iter().map(|t| (t.name, t.major, (t.pitch * 1.0e5).round() / 1.0e5)).collect();
+    assert_eq!(
+        table,
+        [
+            ("10-24", 4.826, 1.05833),
+            ("10-32", 4.826, 0.79375),
+            ("1/4-20", 6.35, 1.27),
+            ("1/4-28", 6.35, 0.90714),
+            ("5/16-18", 7.9375, 1.41111),
+            ("5/16-24", 7.9375, 1.05833),
+            ("3/8-16", 9.525, 1.5875),
+            ("3/8-24", 9.525, 1.05833),
+            ("M5", 5.0, 0.8),
+            ("M6", 6.0, 1.0),
+            ("M8", 8.0, 1.25),
+            ("M10", 10.0, 1.5),
+        ]
+    );
     for (i, t) in THREADS.iter().enumerate() {
         assert!(t.pitch >= 0.79 && t.pitch <= 1.6 && t.major >= 4.8 && t.major <= 10.0, "{t:?}");
         assert!(t.bore() > 3.7 && t.bore() < t.major, "{t:?}");
@@ -638,6 +657,10 @@ fn thread_feeds_keep_the_chip_at_the_cutting_edge_and_slow_the_tool_centre() {
     for fit in [f64::NAN, f64::INFINITY, -0.21, 0.51, -1.0e9] {
         assert!(thread_feed(&quarter, fit, &mill, Material::Aluminum, Tier::Standard, &m).is_err(), "{fit}");
     }
+    // A machine slower than any thread feed is held to, not a panic.
+    let slow = MachineProfile { max_feed: 5.0, ..machine() };
+    let held = thread_feed(&quarter, 0.0, &mill, Material::Aluminum, Tier::Standard, &slow).unwrap();
+    assert_eq!((held.feed, held.plunge), (5.0, 5.0));
 }
 
 /// The cutting points of `op` as distance from `centre` and height.
@@ -667,7 +690,6 @@ fn a_threaded_hole_is_bored_to_size_then_thread_milled_last_with_the_thread_mill
     );
     let far = |pts: &[(f64, f64)]| pts.iter().map(|p| p.0).fold(0.0, f64::max);
     let low = |pts: &[(f64, f64)]| pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
-    let high = |pts: &[(f64, f64)]| pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
     // The plain hole is cut as drawn and 0.2 mm through; the threaded one at ⌀5.08 mm whatever
     // was drawn, and a pitch and 1 mm below the plate.
     let plain = round(&plan.operations[1], v(15.0, 20.0));
@@ -680,12 +702,19 @@ fn a_threaded_hole_is_bored_to_size_then_thread_milled_last_with_the_thread_mill
     assert!(far(&round(&plan.operations[2], v(45.0, 20.0))) <= 2.54 - 1.5875 - 0.2 + 0.01);
     // The outside is cut as ever.
     close(low(&round(&plan.operations[5], v(0.0, 0.0))), -6.2, 1e-6);
-    // The plan says how deep the spoilboard is cut under the hole.
-    assert_eq!(plan.issues.len(), 1, "{:?}", plan.issues);
-    assert_eq!((plan.issues[0].severity, plan.issues[0].at.as_deref()), (Severity::Warning, Some("Thread 1/4-20, 1 hole")));
+    // The plan says, of the part as a whole (the cutter's program), that the hole is cut at the
+    // thread's size, not as drawn, and how deep under the plate; and of the thread operation how
+    // far the thread mill goes.
+    assert_eq!(plan.issues.len(), 2, "{:?}", plan.issues);
+    assert_eq!((plan.issues[0].severity, plan.issues[0].at.as_deref()), (Severity::Warning, None));
     assert!(plan.issues[0].message.contains("2.27 mm below the plate") && plan.issues[0].message.contains("spoilboard"), "{:?}", plan.issues);
-    // And that the hole is cut at the thread's size, not as it was drawn.
-    assert!(plan.issues[0].message.contains("⌀5.08 mm whatever was drawn"), "{:?}", plan.issues);
+    assert!(plan.issues[0].message.contains("⌀5.08 mm whatever was drawn") && plan.issues[0].message.contains("1/4-20"), "{:?}", plan.issues);
+    assert_eq!((plan.issues[1].severity, plan.issues[1].at.as_deref()), (Severity::Warning, Some("Thread 1/4-20, 1 hole")));
+    assert!(
+        plan.issues[1].message.contains("thread mill goes 1.77 mm below the plate") && !plan.issues[1].message.contains("spoilboard"),
+        "{:?}",
+        plan.issues
+    );
 
     // The thread is milled with the thread mill at the thread's own feed.
     let thread = &plan.operations[6];
@@ -699,7 +728,9 @@ fn a_threaded_hole_is_bored_to_size_then_thread_milled_last_with_the_thread_mill
     // and half a pitch above the plate's top; its centre reaches the major radius less its own.
     let cutting = round(thread, v(45.0, 20.0));
     close(low(&cutting), -(6.0 + 1.27 + 0.5), 1e-6);
-    close(high(&cutting), 0.5 * 1.27, 1e-6);
+    let arcs_end =
+        thread.path.moves.iter().filter_map(|mv| if let Move::Arc { to, .. } = mv { Some(to.z) } else { None }).fold(f64::NEG_INFINITY, f64::max);
+    close(arcs_end, 0.5 * 1.27, 1e-6);
     close(far(&cutting), 3.175 - 2.286, 1e-6);
     // Nothing of it leaves the hole: every position, rapids too, is over the bore.
     assert!(thread.path.points(0.01).iter().all(|(p, _)| ((p.x - 45.0).powi(2) + (p.y - 20.0).powi(2)).sqrt() <= 3.175 - 2.286 + 1e-6));
@@ -803,9 +834,21 @@ fn threads_of_a_size_share_an_operation_and_round_holes_are_named_as_the_plan_na
         }
     }
     assert_eq!(visited, [(10.0, 10.0), (50.0, 10.0), (50.0, 30.0)]);
+    // From hole to hole it crosses the plate at the clearance height, as every other cut does:
+    // over a clamp or a screw head, never 1 mm above the plate.
+    let mut from: Option<Vec3> = None;
+    for mv in &quarter_op.path.moves {
+        if let (Move::Rapid { to }, Some(at)) = (mv, from) {
+            let sideways = (to.x - at.x).abs() > 1e-9 || (to.y - at.y).abs() > 1e-9;
+            assert!(!sideways || (to.z >= 5.0 - 1e-9 && at.z >= 5.0 - 1e-9), "a rapid sideways from Z{} to Z{}", at.z, to.z);
+        }
+        if let Some(to) = mv.target() {
+            from = Some(to);
+        }
+    }
     // The hole 0.004 mm from where it was named is threaded on its own centre.
     assert!(round(quarter_op, v(50.0, 10.0)).iter().filter(|p| p.0 < 2.0).map(|p| p.0).fold(0.0, f64::max) <= 3.175 - 1.7145 + 1e-6);
-    assert_eq!(plan.issues.iter().filter(|i| i.severity == Severity::Warning).count(), 2, "{:?}", plan.issues);
+    assert_eq!(plan.issues.iter().filter(|i| i.severity == Severity::Warning).count(), 4, "{:?}", plan.issues);
     // No threads asked for is the plan without them.
     let none = Threading { holes: vec![], ..threading.clone() };
     let cut = PartCut::new(Material::Aluminum, 6.0);
@@ -838,6 +881,21 @@ fn threads_that_cannot_be_milled_as_asked_stop_the_plan_and_say_what_to_change()
     stopped(plan_part_threaded(&slotted, &[], Some(&slot), &tool, &cut, &m).unwrap(), &["no round hole"]);
     // The 6 mm cutter does not fit the ⌀5.08 mm hole of the thread: no centre mark, the plan stops.
     stopped(asked(at(45.0, 20.0), thread_mill(4.572, 12.0), &one_flute(6.0), &cut).unwrap(), &["6 mm cutter", "5.08 mm", "1/4-20"]);
+    // A cutter nearly as wide as the hole would plunge with no room for its chips: half a
+    // millimetre of room is asked, and little room is said.
+    stopped(asked(at(45.0, 20.0), thread_mill(4.572, 12.0), &one_flute(4.7), &cut).unwrap(), &["4.7 mm cutter", "5.08 mm", "at most 4.58 mm"]);
+    let tight = asked(at(45.0, 20.0), thread_mill(4.572, 12.0), &one_flute(4.5), &cut).unwrap();
+    assert!(!tight.operations.is_empty() && tight.issues.iter().all(|i| i.severity == Severity::Warning));
+    assert!(tight.issues.iter().any(|i| i.message.contains("little room for chips") && i.message.contains("4.5 mm cutter")), "{:?}", tight.issues);
+    // A thread whose hole is bored larger than it was drawn must stay inside the part and clear
+    // of its other openings: a wrong hole picked for a large thread is stopped, not cut through.
+    let m10 = find("M10").unwrap();
+    let near_edge = plate_with(&[(3.0, 20.0, 1.5), (30.0, 20.0, 1.5), (35.0, 20.0, 1.5)]);
+    let big = |x: f64| Threading { holes: vec![ThreadedHole { center: v(x, 20.0), thread: m10 }], tool: thread_mill(4.572, 12.0), fit: 0.0 };
+    stopped(plan_part_threaded(&near_edge, &[], Some(&big(3.0)), &tool, &cut, &m).unwrap(), &["M10", "⌀3 mm", "edge or into another opening"]);
+    stopped(plan_part_threaded(&near_edge, &[], Some(&big(30.0)), &tool, &cut, &m).unwrap(), &["M10", "edge or into another opening"]);
+    let roomy = plate_with(&[(30.0, 20.0, 1.5)]);
+    assert!(plan_part_threaded(&roomy, &[], Some(&big(30.0)), &tool, &cut, &m).unwrap().issues.iter().all(|i| i.severity == Severity::Warning));
     // The thread mill must fit the hole with room, and reach through the plate and below it.
     stopped(asked(at(45.0, 20.0), thread_mill(5.0, 12.0), &tool, &cut).unwrap(), &["thread mill", "5.08 mm", "4.98 mm"]);
     stopped(asked(at(45.0, 20.0), thread_mill(4.572, 7.5), &tool, &cut).unwrap(), &["reach", "7.77 mm"]);

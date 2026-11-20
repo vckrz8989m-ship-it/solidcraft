@@ -1,0 +1,50 @@
+# Fork-only workflow: runs the Router CAM's own tests on Linux for the router-cam branch.
+#
+# The cloud workspace the Router CAM is written in cannot build the unit-test binaries of the
+# design, engine and app crates (they are too large for it), so the tests kept in those crates'
+# own test modules run here. This is a personal fork's check, not SolidCraft's CI.
+name: Router CAM tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [router-cam]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: router-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Router CAM tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: "0"
+      # Debug information is most of a test binary's size, and the runner's disk is small.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Planner tests (cam crate)
+        run: cargo test -p solidcraft-cam --lib router
+      - name: Saved design tests (doc crate)
+        run: cargo test -p solidcraft-doc --lib cam::
+      - name: Command tests (engine crate)
+        run: cargo test -p solidcraft-engine --lib cmd::cam::
+      - name: Dialog tests (app crate)
+        run: cargo test -p solidcraft-ui-egui --lib -- dialogs_cut_out dialogs_carve
+      - name: Disk left
+        if: always()
+        run: df -h /
