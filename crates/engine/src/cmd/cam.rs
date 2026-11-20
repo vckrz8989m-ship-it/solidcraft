@@ -119,6 +119,8 @@ pub static COMMANDS: &[CommandSpec] = &[
          machine?: flexihal-router (the default when the setup cuts out a part; its post, and its checks: spindle range, feeds and arcs it can follow, codes and \
          machine-coordinate moves its controller refuses); machine_origin?: [x,y,z] the work zero in machine coordinates \
          (checks travel when the machine's is known); program?: name (default the setup's); \
+         tool?: number (only the operations that tool cuts; a setup whose part has threads is posted one cutter at a time, \
+         since the thread mill is zeroed anew); \
          path?: file the G-code is written to, once it has passed every check → \
          {gcode, extension, post, operations, readback, extents: {min, max} of all motion in work coordinates, \
          machine?, issues?, path?}. G-code is always read back and checked \
@@ -441,12 +443,13 @@ fn part_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(stop) = plan.issues.iter().find(|i| i.severity == Severity::Error) {
         return Err(bad(cmd, stop.message.clone()));
     }
+    store_op(s, cmd, &setup_name, op)?;
+    // Once the part is kept nothing can refuse: its new thread mill is kept with it.
     if let (Some(mill), true) = (mill, new_mill) {
         let doc = s.doc_mut();
         doc.cam.tools.push(mill);
         doc.cam.tools.sort_by_key(|t| t.number);
     }
-    store_op(s, cmd, &setup_name, op)?;
     Ok(json!({
         "setup": setup_name,
         "operation": name,
@@ -778,6 +781,24 @@ fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, format!("setup `{setup_name}` has no operations")));
     }
     let has_part = setup.operations.iter().any(|op| matches!(op, CamOperation::Part { .. }));
+    let only = match p.get("tool") {
+        None | Some(Value::Null) => None,
+        Some(_) => {
+            Some(num(p, "tool").filter(|n| *n >= 1.0 && n.fract() == 0.0).map(|n| n as u32).ok_or_else(|| bad(cmd, "`tool` must be a tool number"))?)
+        }
+    };
+    // A thread mill is zeroed anew, which a stop in the middle of a program gives no way to do.
+    if only.is_none()
+        && let Some(CamOperation::Part { name, tool, thread_tool: Some(mill), .. }) =
+            setup.operations.iter().find(|op| matches!(op, CamOperation::Part { threads, .. } if !threads.is_empty()))
+    {
+        return Err(bad(
+            cmd,
+            format!(
+                "operation `{name}` has threads, milled with another cutter that is zeroed anew: post one cutter at a time with `tool` ({tool} cuts it out, {mill} mills its threads)"
+            ),
+        ));
+    }
     let machine = match str_(p, "machine") {
         Some(name) => Some(machine_named(cmd, name)?),
         // A part's feeds are a machine's, so its program is written for one.
@@ -811,6 +832,15 @@ fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         };
         let path = build_path(s, &setup, op).map_err(|e| bad(cmd, e))?;
         program.operations.push(Operation { name: op.name().into(), tool, spindle_rpm, coolant, path });
+    }
+    if let Some(n) = only {
+        // What another cutter does goes, with what was said of it.
+        let (kept, left): (Vec<Operation>, Vec<Operation>) = program.operations.into_iter().partition(|o| o.tool.number == n);
+        if kept.is_empty() {
+            return Err(bad(cmd, format!("no operation of setup `{setup_name}` is cut with tool {n}")));
+        }
+        planning.retain(|i| !i.at.as_deref().is_some_and(|at| left.iter().any(|o| o.name == at)));
+        program.operations = kept;
     }
     let path = path_param(cmd, p)?;
     write_program(cmd, &program, &post, machine.as_ref(), planning, p.get("machine_origin"), path)
@@ -2286,10 +2316,23 @@ mod tests {
         let saved = s.doc.to_json();
         assert!(saved.contains("\"threads\"") && saved.contains("\"thread_tool\""), "{saved}");
 
-        // The setup posted whole puts the threads after the cuts, with the post's stop to change tools.
-        let posted = run(&mut s, "cam.post", json!({"setup": "Router"}));
+        // The setup posted whole would change cutters at a stop, with no way to zero the thread mill
+        // there: it is posted one cutter at a time.
+        let mixed = s.execute("cam.post", &json!({"setup": "Router"})).unwrap_err().to_string();
+        assert!(mixed.contains("one cutter at a time") && mixed.contains("`tool`"), "{mixed}");
+        let posted = run(&mut s, "cam.post", json!({"setup": "Router", "tool": 1}));
         let text = posted["gcode"].as_str().unwrap();
-        assert!(text.contains("Thread 1/4-20") && text.lines().any(|l| l == "M0"), "{text}");
+        assert!(text.contains("Outside finish") && text.contains("Z-8.27") && !text.contains("Thread") && !text.lines().any(|l| l == "M0"), "{text}");
+        assert!(!posted["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("spoilboard"))));
+        let posted = run(&mut s, "cam.post", json!({"setup": "Router", "tool": 2}));
+        let text = posted["gcode"].as_str().unwrap();
+        assert!(text.contains("Thread 1/4-20") && !text.contains("Outside") && !text.lines().any(|l| l == "M0"), "{text}");
+        assert!(posted["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("spoilboard"))));
+        assert_eq!(posted["operations"].as_u64(), Some(1));
+        for (tool, why) in [(json!(9), "is cut with tool 9"), (json!("x"), "`tool` must be"), (json!(1.5), "`tool` must be")] {
+            let e = s.execute("cam.post", &json!({"setup": "Router", "tool": tool})).unwrap_err().to_string();
+            assert!(e.contains(why), "{tool}: {e}");
+        }
         // A part saved by cam.op.part plans its threads the same way.
         let part = run(
             &mut s,

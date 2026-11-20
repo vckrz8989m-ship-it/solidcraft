@@ -684,6 +684,8 @@ fn a_threaded_hole_is_bored_to_size_then_thread_milled_last_with_the_thread_mill
     assert_eq!(plan.issues.len(), 1, "{:?}", plan.issues);
     assert_eq!((plan.issues[0].severity, plan.issues[0].at.as_deref()), (Severity::Warning, Some("Thread 1/4-20, 1 hole")));
     assert!(plan.issues[0].message.contains("2.27 mm below the plate") && plan.issues[0].message.contains("spoilboard"), "{:?}", plan.issues);
+    // And that the hole is cut at the thread's size, not as it was drawn.
+    assert!(plan.issues[0].message.contains("⌀5.08 mm whatever was drawn"), "{:?}", plan.issues);
 
     // The thread is milled with the thread mill at the thread's own feed.
     let thread = &plan.operations[6];

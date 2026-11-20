@@ -638,8 +638,10 @@ pub fn plan_part_threaded(
             plan.issues.push(Issue::warning(
                 Some(name.clone()),
                 format!(
-                    "{} bored {} mm below the plate, into the spoilboard, for the thread to run out of the bottom: the thread mill goes {} mm below it",
+                    "{} bored ⌀{} mm whatever was drawn, and {} mm below the plate, into the spoilboard, for the thread to run out of the \
+                     bottom: the thread mill goes {} mm below it",
                     if n == 1 { "the hole is" } else { "the holes are" },
+                    mm(thread.bore()),
                     mm(thread.bored_below().max(cut.break_through)),
                     mm(thread.below())
                 ),

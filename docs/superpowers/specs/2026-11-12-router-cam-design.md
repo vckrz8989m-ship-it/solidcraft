@@ -74,6 +74,8 @@ its finishing file (46 444 lines). The simulator has default
 settings, not this machine's, so travel limits, speeds and the spindle are untested, and
 nothing has been cut.
 
+Thread milling in plate parts is built on `router-layer` (see its section below).
+
 Not built yet: drilling and helical bores as operations of their own, a finishing pass on
 pocket floors, a tool library with proven recipes, schemas for the CAM commands, carving a
 second side.
@@ -128,8 +130,9 @@ How it works:
   both checked before either is written; its reply gains `thread` (the second program as
   the first is told) and the saved part keeps `threads`, `thread_tool` and `thread_fit`.
   `cam.holes` lists a part's round openings (name, centre, diameter) for a front end.
-  `cam.post` of a setup whose part has threads puts them after the cuts in one program, with
-  the post's tool-change stop, as for any setup with two tools.
+  `cam.post` of a setup whose part has threads refuses to write both cutters' work as one
+  program (a stop in a program gives no way to zero the thread mill): it is asked a cutter
+  at a time, with `tool`.
 - Cut Out Part lists the round holes with a thread choice each; once one is chosen it asks for
   the thread mill (remembered ones by name) and the fit. Check lists the thread file's time
   and cuts after the first file's.
@@ -139,6 +142,18 @@ Left to the builder: wording of messages, the row layout in the dialog.
 Limits to state: the part is on its holding tabs while it is threaded; the tooth is taken to
 be at the thread mill's tip; threads smaller than 10-24 are not offered; feeds and the bore
 size are untested on the machine, so the first thread is a test hole in scrap.
+
+Built on 2026-11-19 (branch `router-layer`), and how far it is tested: the planner's tests
+(`router_tests.rs`: the table, the feeds, a threaded hole bored and milled, refusals and
+hostile values) pass with the rest of the CAM crate's. The command and the dialog pass their
+tests run from a scratch integration test in the cloud workspace (the engine's, the design
+crate's and the app's own unit-test binaries do not build there, so the copies in those
+crates' test modules have not been run). A demo plate (80 x 50 x 6.35 mm, two 1/4-20, one M5
+and one 10-32 with a 3.429 mm thread mill) was written as its two files: the router skill's
+`gcode_check.py` reports 0 errors on both (thread file: 295 lines, about 4 minutes). Not done
+yet: grblHAL's check mode on the laptop's simulator, a Windows build with this in it, and any
+cut. Not checked by the planner: that a hole bored larger than it was drawn still lies inside
+the part and clear of its other openings.
 
 ## Scope
 
