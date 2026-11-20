@@ -40,9 +40,9 @@ jobs:
       - name: Planner tests (cam crate)
         run: cargo test -p solidcraft-cam --lib router
       - name: Saved design tests (doc crate)
-        run: cargo test -p solidcraft-doc --lib cam::
+        run: "cargo test -p solidcraft-doc --lib cam::"
       - name: Command tests (engine crate)
-        run: cargo test -p solidcraft-engine --lib cmd::cam::
+        run: "cargo test -p solidcraft-engine --lib cmd::cam::"
       - name: Dialog tests (app crate)
         run: cargo test -p solidcraft-ui-egui --lib -- dialogs_cut_out dialogs_carve
       - name: Disk left
