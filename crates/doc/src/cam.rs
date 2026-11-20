@@ -28,6 +28,8 @@ pub const MAX_HOLES: usize = 1_000;
 pub const MAX_REGIONS: usize = 256;
 /// Most pocket depths in one part operation.
 pub const MAX_PART_POCKETS: usize = 32;
+/// Most threads one part operation may keep.
+pub const MAX_PART_THREADS: usize = 500;
 
 /// The design's CAM data: tools, setups and optional named posts.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -724,6 +726,10 @@ fn plunge_mm() -> Expr {
     Expr::new("200 mm")
 }
 
+fn is_zero_mm(e: &Expr) -> bool {
+    e.as_str() == "0 mm"
+}
+
 fn is_tabs(hold: &Hold) -> bool {
     *hold == Hold::Tabs
 }
@@ -799,7 +805,26 @@ pub enum CamOperation {
         /// Recesses cut into the part before its openings.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pockets: Vec<CamPartPocket>,
+        /// Round openings a thread is milled in: each is bored to its thread's size, and the
+        /// threads are milled last with `thread_tool`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        threads: Vec<CamPartThread>,
+        /// The thread mill's tool number; a part with threads has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_tool: Option<u32>,
+        /// Added to the threads' major diameter: above 0 cuts deeper and loosens them.
+        #[serde(default = "zero_mm", skip_serializing_if = "is_zero_mm")]
+        thread_fit: Expr,
     },
+}
+
+/// A thread in a part: the round opening it is milled in, named by its centre, and its size.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CamPartThread {
+    /// The opening's centre in the setup's XY (mm).
+    pub at: [f64; 2],
+    /// The thread's name in `solidcraft_cam::router::threads` (`1/4-20`, `M6`).
+    pub thread: String,
 }
 
 /// Recesses of one depth in a part: the closed shapes of `geometry`, cut `depth` deep from the
@@ -866,7 +891,23 @@ impl CamOperation {
                 check_expr(&params.ramp_angle, "ramp_angle")?;
                 check_spindle(*spindle_rpm)?;
             }
-            CamOperation::Part { thickness, top, finish_stock, break_through, pockets, .. } => {
+            CamOperation::Part { thickness, top, finish_stock, break_through, pockets, threads, thread_tool, thread_fit, .. } => {
+                check_expr(thread_fit, "thread_fit")?;
+                if threads.len() > MAX_PART_THREADS {
+                    return Err(DocError::Invalid(format!("a part has at most {MAX_PART_THREADS} threads")));
+                }
+                if !threads.is_empty() && thread_tool.is_none() {
+                    return Err(DocError::Invalid("a part with threads needs a thread mill (`thread_tool`)".into()));
+                }
+                for thread in threads {
+                    if thread.at.iter().any(|v| !v.is_finite() || v.abs() > 1.0e6) {
+                        return Err(DocError::Invalid("a thread's hole must be at a finite point".into()));
+                    }
+                    if solidcraft_cam::router::threads::find(&thread.thread).is_none() {
+                        let name: String = thread.thread.chars().take(32).collect();
+                        return Err(DocError::Invalid(format!("unknown thread `{name}`")));
+                    }
+                }
                 check_expr(thickness, "thickness")?;
                 check_expr(top, "top")?;
                 check_expr(finish_stock, "finish_stock")?;
@@ -930,7 +971,46 @@ mod tests {
         );
         assert_eq!(*hold, Hold::Tabs);
         let written = serde_json::to_string(&op).unwrap();
-        assert!(!written.contains("hold") && !written.contains("pockets"), "{written}");
+        assert!(!written.contains("hold") && !written.contains("pockets") && !written.contains("thread"), "{written}");
+        // Threads are kept by their hole's centre and their name, with the thread mill and the fit.
+        let threaded_text = text.replace(
+            r#""thickness":"6 mm""#,
+            r#""thickness":"6 mm","threads":[{"at":[45.0,20.0],"thread":"1/4-20"}],"thread_tool":2,"thread_fit":"0.1 mm""#,
+        );
+        let threaded: CamOperation = serde_json::from_str(&threaded_text).unwrap();
+        threaded.validate().unwrap();
+        assert_eq!(serde_json::from_str::<CamOperation>(&serde_json::to_string(&threaded).unwrap()).unwrap(), threaded);
+        let CamOperation::Part { threads, thread_tool, thread_fit, .. } = &threaded else { panic!("not a part") };
+        assert_eq!(
+            (threads.len(), threads[0].at, threads[0].thread.as_str(), *thread_tool, thread_fit.as_str()),
+            (1, [45.0, 20.0], "1/4-20", Some(2), "0.1 mm")
+        );
+        // A part read without them has none; one with them needs its thread mill, a known
+        // thread and a finite point.
+        let CamOperation::Part { threads, thread_tool, thread_fit, .. } = &op else { panic!("not a part") };
+        assert_eq!((threads.len(), *thread_tool, thread_fit.as_str()), (0, None, "0 mm"));
+        for (from, to) in [(r#","thread_tool":2"#, ""), ("1/4-20", "M7"), ("45.0", "1e400"), (r#""0.1 mm""#, r#"" ""#)] {
+            let broken = serde_json::from_str::<CamOperation>(&threaded_text.replace(from, to));
+            assert!(broken.is_err() || broken.is_ok_and(|b| b.validate().is_err()), "{from} to {to}");
+        }
+        let crowd = CamOperation::Part {
+            name: "Plate".into(),
+            tool: 1,
+            geometry: CamGeometry::Sketch { sketch: 3, profiles: profile_all() },
+            material: Material::Aluminum,
+            thickness: Expr::new("6 mm"),
+            tier: Tier::Standard,
+            top: zero_mm(),
+            finish_stock: finish_stock_mm(),
+            break_through: break_through_mm(),
+            coolant: true,
+            hold: Hold::Tabs,
+            pockets: Vec::new(),
+            threads: vec![CamPartThread { at: [0.0, 0.0], thread: "M6".into() }; MAX_PART_THREADS + 1],
+            thread_tool: Some(2),
+            thread_fit: zero_mm(),
+        };
+        assert!(crowd.validate().is_err());
         // Pockets are kept with their sketch and their depth, and a blank depth is refused.
         let with =
             text.replace(r#""thickness":"6 mm""#, r#""thickness":"6 mm","pockets":[{"geometry":{"type":"sketch","sketch":4},"depth":"2 mm"}]"#);
@@ -957,6 +1037,9 @@ mod tests {
             coolant: false,
             hold: Hold::None,
             pockets: Vec::new(),
+            threads: Vec::new(),
+            thread_tool: None,
+            thread_fit: zero_mm(),
         };
         assert!(blank.validate().is_err());
     }

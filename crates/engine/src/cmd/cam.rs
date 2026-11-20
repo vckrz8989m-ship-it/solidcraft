@@ -5,17 +5,19 @@
 
 use serde_json::{Value, json};
 use solidcore_record::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
-use solidcraft_cam::router::auto::{PartCut, Planned, Pocket, plan_part_with};
+use solidcraft_cam::router::auto::{PartCut, Planned, Pocket, ThreadedHole, Threading, plan_part_threaded, round_holes};
 use solidcraft_cam::router::feeds::{CutKind, FeedRequest, Material, Tier, recipe};
 use solidcraft_cam::router::solid::{SolidCut, block, plan_solid};
+use solidcraft_cam::router::threads::{THREADS, find as find_thread};
 use solidcraft_cam::router::{Issue, MachineProfile, Severity, check_program, check_text, check_travel};
 use solidcraft_cam::{
     ContourParams, Cut, Feeds, Frame, Heights, Move, Operation, PocketParams, Post, Program, Side, Surface, Tool, ToolKind, contour, emit, pocket,
     readback,
 };
 use solidcraft_doc::cam::{
-    CamContourParams, CamCut, CamFaceRef, CamGeometry, CamOperation, CamPartPocket, CamPocketParams, CamSettings, CamSetup, CamSide, MAX_OPS,
-    MAX_SETUPS, MAX_TOOLS, PolygonRegion, StockBox, WcsOriginMode, default_contour_params, default_cut, default_pocket_params,
+    CamContourParams, CamCut, CamFaceRef, CamGeometry, CamOperation, CamPartPocket, CamPartThread, CamPocketParams, CamSettings, CamSetup, CamSide,
+    MAX_OPS, MAX_PART_THREADS, MAX_SETUPS, MAX_TOOLS, PolygonRegion, StockBox, WcsOriginMode, default_contour_params, default_cut,
+    default_pocket_params,
 };
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::project::resolve_face_indices;
@@ -29,8 +31,9 @@ use crate::{Result, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_cmd).icon("hole").params(
-        "number (1…9999); kind?: flat_endmill|ball_endmill|drill (default flat_endmill); diameter (mm); flute_length (mm); \
-         description?; flutes?; spindle_rpm?; feed?; plunge_feed?; stepdown?; stepover?",
+        "number (1…9999); kind?: flat_endmill|ball_endmill|drill|thread_mill (default flat_endmill; a thread mill is single-form, \
+         its flute_length its reach); diameter (mm); flute_length (mm); description?; flutes?; spindle_rpm?; feed?; plunge_feed?; \
+         stepdown?; stepover?",
     ),
     CommandSpec::new("cam.tool.remove", "Remove Tool", tool_remove).icon("delete").params("number"),
     CommandSpec::new("cam.setup", "CAM Setup", setup_cmd).icon("settings").params(
@@ -60,6 +63,8 @@ pub static COMMANDS: &[CommandSpec] = &[
          hold?: tabs|none (default tabs: three to eight holding tabs are left round the outside); \
          pockets?: [{sketch | faces | outer | regions, depth}] (recesses cut depth deep from the top, before the openings; \
          what is drawn inside one is left standing); \
+         threads?: [{at: [x, y], thread}] with thread_mill (a defined thread mill's number, or thread_mill_diameter as cam.cut_out) \
+         and thread_fit? as cam.cut_out; \
          machine?: (default flexihal-router; what the plan is tried on, cam.post names the one it is written for) → \
          {setup, operation, cuts: [names in cutting order], issues}. Every opening the tool fits is roughed and \
          finished, nearest first, then the outside is, at the machine's feeds; the cuts are planned again when posting.",
@@ -69,12 +74,25 @@ pub static COMMANDS: &[CommandSpec] = &[
          material: aluminum|aluminum_soft|brass|acrylic|soft_plastic|hardwood|softwood; thickness (of the plate); \
          tool?: number of a defined tool, or tool_diameter with flutes? (default 1) and flute_length? (default 3 diameters): \
          a tool of that size is used, or defined under the next free number; tier?: careful|standard|bold; hold?: tabs|none; pockets?: [{sketch, depth}] as cam.op.part; \
+         threads?: [{at: [x, y], thread}] (a round opening by its centre in the setup's XY, as cam.holes lists them, and a thread: \
+         10-24|10-32|1/4-20|1/4-28|5/16-18|5/16-24|3/8-16|3/8-24|M5|M6|M8|M10; the opening is bored at the thread's size, not as drawn), \
+         with thread_mill?: number of a defined thread mill, or thread_mill_diameter with thread_mill_flutes? (default 3) and \
+         thread_mill_reach? (default 3 diameters): a single-form 60° thread mill, used or defined as the cutter is; \
+         thread_fit? (added to the threads' major diameter, -0.2 to 0.5 mm, default 0: above 0 loosens them); \
          name?: the operation's (default the sketch's name); setup?: (default Router, made when missing: work zero at the \
          sketch origin, Z 0 on the plate's top); machine?: (default flexihal-router); path?: file the G-code is written to; \
          dry_run?: bool (plan and check only: nothing is kept in the design or written); \
          paths?: bool (also reply paths: [{name, points: [[x, y, z, cutting 1|0]]}] in model coordinates, to draw) → \
-         {setup, operation, tool, cuts: [{name, rpm, feed}] in cutting order, issues, extents, gcode, readback, path?}. One step from a drawn outline to a \
-         checked program of that part alone: the part is kept in the setup as cam.op.part would keep it.",
+         {setup, operation, tool, cuts: [{name, rpm, feed}] in cutting order, issues, extents, gcode, readback, path?, \
+         thread?: {name, tool, cuts, issues, extents, gcode, readback, path?}}. One step from a drawn outline to a \
+         checked program of that part alone: the part is kept in the setup as cam.op.part would keep it. With threads there are \
+         two programs, one a cutter (the thread mill is zeroed anew): the reply's own and `thread`, written with `-1-cut` and \
+         `-2-thread` put before the path's extension, both checked before either is written.",
+    ),
+    CommandSpec::new("cam.holes", "List Part Holes", holes_cmd).icon("hole").noundo().params(
+        "sketch?: id or name (default the newest sketch), with profiles?; faces?; or outer/regions; holes?; setup?: (default Router) → \
+         {holes: [{name, at: [x, y], diameter}], threads: [names]}: the part's round openings as cam.cut_out names them, their \
+         centres in the setup's XY (mm): the holes a thread can be milled in, and the threads cam.cut_out mills.",
     ),
     CommandSpec::new("cam.carve", "Carve Solid to G-code", carve_cmd).icon("cut").noundo().params(
         "body?: name (default the design's only body); \
@@ -127,7 +145,8 @@ fn tool_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         "flat_endmill" => ToolKind::FlatEndmill,
         "ball_endmill" => ToolKind::BallEndmill,
         "drill" => ToolKind::Drill,
-        other => return Err(bad(cmd, format!("unknown tool kind `{other}` (flat_endmill, ball_endmill, drill)"))),
+        "thread_mill" => ToolKind::ThreadMill,
+        other => return Err(bad(cmd, format!("unknown tool kind `{other}` (flat_endmill, ball_endmill, drill, thread_mill)"))),
     };
     let diameter = num(p, "diameter").ok_or_else(|| bad(cmd, "`diameter` is required (mm)"))?;
     let flute_length = num(p, "flute_length").ok_or_else(|| bad(cmd, "`flute_length` is required (mm)"))?;
@@ -394,6 +413,11 @@ fn part_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         .ok_or_else(|| bad(cmd, "`material` is required: aluminum, aluminum_soft, brass, acrylic, soft_plastic, hardwood or softwood"))?;
     let tier: Tier = word(cmd, p, "tier", "careful, standard or bold")?.unwrap_or_default();
     let machine = machine_named(cmd, str_(p, "machine").unwrap_or(DEFAULT_MACHINE))?;
+    let threads = threads_param(cmd, p)?;
+    let (mill, new_mill) = match threads.is_empty() {
+        true => (None, false),
+        false => thread_mill_param(s, cmd, p, &[tool]).map(|(mill, new)| (Some(mill), new))?,
+    };
     let op = CamOperation::Part {
         name: name.clone(),
         tool,
@@ -407,12 +431,20 @@ fn part_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         coolant: bool_(p, "coolant").unwrap_or(true),
         hold: word(cmd, p, "hold", "tabs or none")?.unwrap_or_default(),
         pockets: pockets_param(s, cmd, p)?,
+        threads,
+        thread_tool: mill.as_ref().map(|m| m.number),
+        thread_fit: expr(p, "thread_fit").unwrap_or_else(|| Expr::new("0 mm")),
     };
     op.validate().map_err(|e| bad(cmd, e.to_string()))?;
     let setup = s.doc.cam.setup(&setup_name).cloned().ok_or_else(|| bad(cmd, format!("no setup `{setup_name}` (cam.setup first)")))?;
-    let plan = plan_op(s, &setup, &op, &cutter, &machine).map_err(|e| bad(cmd, e))?;
+    let plan = plan_op(s, &setup, &op, &cutter, mill.as_ref(), &machine).map_err(|e| bad(cmd, e))?;
     if let Some(stop) = plan.issues.iter().find(|i| i.severity == Severity::Error) {
         return Err(bad(cmd, stop.message.clone()));
+    }
+    if let (Some(mill), true) = (mill, new_mill) {
+        let doc = s.doc_mut();
+        doc.cam.tools.push(mill);
+        doc.cam.tools.sort_by_key(|t| t.number);
     }
     store_op(s, cmd, &setup_name, op)?;
     Ok(json!({
@@ -445,12 +477,112 @@ fn pockets_param(s: &Session, cmd: &str, p: &Value) -> Result<Vec<CamPartPocket>
     Ok(out)
 }
 
+/// A part's threads: `threads: [{at: [x, y], thread}]`, each a round opening by its centre in
+/// the setup's XY and a thread's name.
+fn threads_param(cmd: &str, p: &Value) -> Result<Vec<CamPartThread>> {
+    let list = match p.get("threads") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(list)) => list,
+        Some(_) => return Err(bad(cmd, "`threads` must be a list of {at: [x, y], thread}")),
+    };
+    if list.len() > MAX_PART_THREADS {
+        return Err(bad(cmd, format!("a part has at most {MAX_PART_THREADS} threads")));
+    }
+    let mut out = Vec::with_capacity(list.len());
+    for entry in list {
+        if !entry.is_object() {
+            return Err(bad(cmd, "each of `threads` must be {at: [x, y], thread}"));
+        }
+        let at = entry.get("at").and_then(vec2).ok_or_else(|| bad(cmd, "a thread's `at` must be [x, y], its hole's centre (mm)"))?;
+        let known = || THREADS.iter().map(|t| t.name).collect::<Vec<_>>().join(", ");
+        let name = str_(entry, "thread").ok_or_else(|| bad(cmd, format!("a thread's `thread` must be its name ({})", known())))?;
+        let thread =
+            find_thread(name).ok_or_else(|| bad(cmd, format!("unknown thread `{}` ({})", name.chars().take(32).collect::<String>(), known())))?;
+        out.push(CamPartThread { at: [at.x, at.y], thread: thread.name.to_string() });
+    }
+    Ok(out)
+}
+
+/// The thread mill a part's threads are milled with, and whether it is new to the design: a
+/// defined one by number (`thread_mill`), or a single-form one of the size given
+/// (`thread_mill_diameter`, `thread_mill_flutes`, `thread_mill_reach`), which is the design's
+/// own when it has one of that size and else gets the next free number not among `taken`.
+fn thread_mill_param(s: &Session, cmd: &str, p: &Value, taken: &[u32]) -> Result<(Tool, bool)> {
+    if p.get("thread_mill").is_some_and(|v| !v.is_null()) {
+        let n = num(p, "thread_mill")
+            .filter(|n| *n >= 1.0 && n.fract() == 0.0)
+            .map(|n| n as u32)
+            .ok_or_else(|| bad(cmd, "`thread_mill` must be a tool number"))?;
+        let tool = s.doc.cam.tool(n).cloned().ok_or_else(|| bad(cmd, format!("no tool {n} (give `thread_mill_diameter` to define one)")))?;
+        if tool.kind != ToolKind::ThreadMill || taken.contains(&n) {
+            return Err(bad(cmd, format!("tool {n} is not a thread mill")));
+        }
+        return Ok((tool, false));
+    }
+    let Some(d) = length_param(s, cmd, p, "thread_mill_diameter")? else {
+        return Err(bad(cmd, "threads need a thread mill: give `thread_mill` (a defined thread mill's number) or `thread_mill_diameter`"));
+    };
+    let flutes = match p.get("thread_mill_flutes") {
+        None | Some(Value::Null) => 3,
+        Some(_) => num(p, "thread_mill_flutes")
+            .filter(|n| *n >= 1.0 && *n <= 100.0 && n.fract() == 0.0)
+            .map(|n| n as u32)
+            .ok_or_else(|| bad(cmd, "`thread_mill_flutes` must be a whole number 1…100"))?,
+    };
+    let reach = length_param(s, cmd, p, "thread_mill_reach")?.unwrap_or(3.0 * d);
+    let same = |a: f64, b: f64| (a - b).abs() <= 1e-9;
+    let known = s.doc.cam.tools.iter().find(|t| {
+        t.kind == ToolKind::ThreadMill
+            && same(t.diameter, d)
+            && same(t.flute_length, reach)
+            && t.flutes == flutes
+            && t.thread_pitch.is_none()
+            && !taken.contains(&t.number)
+    });
+    if let Some(tool) = known {
+        return Ok((tool.clone(), false));
+    }
+    let number = (1..=9999u32).find(|n| s.doc.cam.tool(*n).is_none() && !taken.contains(n)).ok_or_else(|| bad(cmd, "no tool number is free"))?;
+    if s.doc.cam.tools.len() + taken.iter().filter(|n| s.doc.cam.tool(**n).is_none()).count() >= MAX_TOOLS {
+        return Err(bad(cmd, format!("a design has at most {MAX_TOOLS} tools")));
+    }
+    let mut tool = Tool::new(number, ToolKind::ThreadMill, d, reach);
+    tool.flutes = flutes;
+    tool.description = format!("{d} mm thread mill, {flutes} flute{}", if flutes == 1 { "" } else { "s" });
+    tool.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    Ok((tool, true))
+}
+
 /// The machine a part is planned for when none is named.
 const DEFAULT_MACHINE: &str = "flexihal-router";
 
-/// The cuts of a part operation on `machine`, named after it (`Plate: Outside rough`).
-fn plan_op(s: &Session, setup: &CamSetup, op: &CamOperation, tool: &Tool, machine: &MachineProfile) -> std::result::Result<Planned, String> {
-    let CamOperation::Part { name, geometry, material, thickness, tier, top, finish_stock, break_through, coolant, hold, pockets, .. } = op else {
+/// The cuts of a part operation on `machine`, named after it (`Plate: Outside rough`): the
+/// cutter's, then those of `thread_mill` when the part has threads.
+fn plan_op(
+    s: &Session,
+    setup: &CamSetup,
+    op: &CamOperation,
+    tool: &Tool,
+    thread_mill: Option<&Tool>,
+    machine: &MachineProfile,
+) -> std::result::Result<Planned, String> {
+    let CamOperation::Part {
+        name,
+        geometry,
+        material,
+        thickness,
+        tier,
+        top,
+        finish_stock,
+        break_through,
+        coolant,
+        hold,
+        pockets,
+        threads,
+        thread_fit,
+        ..
+    } = op
+    else {
         return Err(format!("`{}` is not a part operation", op.name()));
     };
     let regions = resolve_geometry(s, setup, geometry)?;
@@ -465,7 +597,22 @@ fn plan_op(s: &Session, setup: &CamSetup, op: &CamOperation, tool: &Tool, machin
     for pocket in pockets {
         recesses.push(Pocket { regions: resolve_geometry(s, setup, &pocket.geometry)?, depth: eval_len(s, &pocket.depth, "pocket depth")? });
     }
-    let mut plan = plan_part_with(&regions, &recesses, tool, &cut, machine).map_err(|e| e.to_string())?;
+    let threading = match threads.is_empty() {
+        true => None,
+        false => {
+            let mill = thread_mill.ok_or("its threads need a thread mill")?;
+            if mill.number == tool.number {
+                return Err(format!("tool {} cannot be both the cutter and the thread mill", tool.number));
+            }
+            let mut holes = Vec::with_capacity(threads.len());
+            for t in threads {
+                let thread = find_thread(&t.thread).ok_or_else(|| format!("unknown thread `{}`", t.thread.chars().take(32).collect::<String>()))?;
+                holes.push(ThreadedHole { center: Vec2::new(t.at[0], t.at[1]), thread });
+            }
+            Some(Threading { holes, tool: mill.clone(), fit: eval_len(s, thread_fit, "thread_fit")? })
+        }
+    };
+    let mut plan = plan_part_threaded(&regions, &recesses, threading.as_ref(), tool, &cut, machine).map_err(|e| e.to_string())?;
     for o in &mut plan.operations {
         o.name = format!("{name}: {}", o.name);
     }
@@ -650,8 +797,12 @@ fn post_cmd(s: &mut Session, p: &Value) -> Result<Value> {
             (CamOperation::Contour { spindle_rpm, coolant, .. } | CamOperation::Pocket { spindle_rpm, coolant, .. }, _) => {
                 (spindle_rpm.or(tool.spindle_rpm).unwrap_or(6000.0), *coolant)
             }
-            (CamOperation::Part { .. }, Some(m)) => {
-                let plan = plan_op(s, &setup, op, &tool, m).map_err(|e| bad(cmd, format!("operation `{}`: {e}", op.name())))?;
+            (CamOperation::Part { thread_tool, .. }, Some(m)) => {
+                let mill = match thread_tool {
+                    Some(n) => Some(s.doc.cam.tool(*n).cloned().ok_or_else(|| bad(cmd, format!("operation `{}` needs tool {n}", op.name())))?),
+                    None => None,
+                };
+                let plan = plan_op(s, &setup, op, &tool, mill.as_ref(), m).map_err(|e| bad(cmd, format!("operation `{}`: {e}", op.name())))?;
                 program.operations.extend(plan.operations);
                 planning.extend(plan.issues);
                 continue;
@@ -767,13 +918,7 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     let machine = machine_named(cmd, str_(p, "machine").unwrap_or(DEFAULT_MACHINE))?;
     let dry_run = bool_(p, "dry_run").unwrap_or(false);
     let with_paths = bool_(p, "paths").unwrap_or(false);
-    // What is cut: what the caller named, else the newest sketch.
-    let mut source = if p.is_object() { p.clone() } else { json!({}) };
-    if !["sketch", "faces", "outer", "regions"].iter().any(|k| p.get(*k).is_some()) {
-        let id = newest_sketch(s).ok_or_else(|| bad(cmd, "draw the part's outline in a sketch first (or name `sketch`, `faces` or `outer`)"))?;
-        source["sketch"] = json!(id);
-    }
-    let geometry = geometry_param(s, cmd, &source)?;
+    let geometry = part_geometry(s, cmd, p)?;
     let name = match str_(p, "name").map(str::trim).filter(|n| !n.is_empty() && n.len() <= 128) {
         Some(n) => n.to_string(),
         None => match &geometry {
@@ -822,6 +967,11 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         }
         (None, None) => return Err(bad(cmd, "give `tool` (a defined tool's number) or `tool_diameter`")),
     };
+    let threads = threads_param(cmd, p)?;
+    let (mill, new_mill) = match threads.is_empty() {
+        true => (None, false),
+        false => thread_mill_param(s, cmd, p, &[tool.number]).map(|(mill, new)| (Some(mill), new))?,
+    };
     let (setup, new_setup) = match s.doc.cam.setup(&setup_name) {
         Some(setup) => (setup.clone(), false),
         None => {
@@ -851,18 +1001,29 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         coolant: bool_(p, "coolant").unwrap_or(true),
         hold: word(cmd, p, "hold", "tabs or none")?.unwrap_or_default(),
         pockets: pockets_param(s, cmd, p)?,
+        threads,
+        thread_tool: mill.as_ref().map(|m| m.number),
+        thread_fit: expr(p, "thread_fit").unwrap_or_else(|| Expr::new("0 mm")),
     };
     op.validate().map_err(|e| bad(cmd, e.to_string()))?;
     // Everything is planned, written and checked before the design is touched.
-    let plan = plan_op(s, &setup, &op, &tool, &machine).map_err(|e| bad(cmd, e))?;
-    let cuts: Vec<Value> = plan.operations.iter().map(|o| json!({"name": o.name, "rpm": o.spindle_rpm, "feed": top_feed(&o.path)})).collect();
-    let program = Program { name: name.clone(), operations: plan.operations, work_offset: Some(setup.work_offset) };
+    let plan = plan_op(s, &setup, &op, &tool, mill.as_ref(), &machine).map_err(|e| bad(cmd, e))?;
+    let told =
+        |ops: &[Operation]| -> Vec<Value> { ops.iter().map(|o| json!({"name": o.name, "rpm": o.spindle_rpm, "feed": top_feed(&o.path)})).collect() };
+    // One program a cutter: this machine changes tools by hand, and each cutter is zeroed anew.
+    let (cut_ops, thread_ops): (Vec<Operation>, Vec<Operation>) = plan.operations.into_iter().partition(|o| o.tool.number == tool.number);
+    let (thread_issues, issues): (Vec<Issue>, Vec<Issue>) =
+        plan.issues.into_iter().partition(|i| i.at.as_deref().is_some_and(|at| thread_ops.iter().any(|o| o.name == at)));
+    let program = Program { name: name.clone(), operations: cut_ops, work_offset: Some(setup.work_offset) };
+    let threading =
+        (!thread_ops.is_empty()).then(|| Program { name: format!("{name} threads"), operations: thread_ops, work_offset: Some(setup.work_offset) });
     // The paths in the model, for a front end to draw over the part.
     let paths = if with_paths {
         let frame = work_frame(&setup).map_err(|e| bad(cmd, e))?;
         let ops: Vec<Value> = program
             .operations
             .iter()
+            .chain(threading.iter().flat_map(|t| &t.operations))
             .map(|o| {
                 let points: Vec<[f64; 4]> = o
                     .path
@@ -881,12 +1042,46 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
         None
     };
     let post = machine.post().map_err(|e| bad(cmd, e.to_string()))?;
-    let path = if dry_run { None } else { path_param(cmd, p)? };
-    let mut out = write_program(cmd, &program, &post, Some(&machine), plan.issues, None, path)?;
+    let base = if dry_run { None } else { path_param(cmd, p)? };
+    // Every program is written out and checked before any file is.
+    let mut out = write_program(cmd, &program, &post, Some(&machine), issues, None, None)?;
     out["setup"] = json!(setup_name);
     out["operation"] = json!(name);
     out["tool"] = json!(tool);
-    out["cuts"] = json!(cuts);
+    out["cuts"] = json!(told(&program.operations));
+    let mut thread_out = match &threading {
+        Some(program) => {
+            let mut reply = write_program(cmd, program, &post, Some(&machine), thread_issues, None, None)?;
+            reply["name"] = json!(program.name);
+            reply["tool"] = json!(mill);
+            reply["cuts"] = json!(told(&program.operations));
+            Some(reply)
+        }
+        None => None,
+    };
+    let mut written: Vec<(String, String)> = Vec::new();
+    if let Some(base) = base {
+        let mut file = |reply: &mut Value, tag: &str| -> Result<()> {
+            let file = if tag.is_empty() { base.to_string() } else { tagged_path(base, tag) };
+            solidcraft_io::vfs::check(&file).map_err(|e| crate::EngineError::Other(e.to_string()))?;
+            written.push((file.clone(), reply["gcode"].as_str().unwrap_or_default().to_string()));
+            reply["path"] = json!(file);
+            Ok(())
+        };
+        match thread_out.as_mut() {
+            Some(reply) => {
+                file(&mut out, "-1-cut")?;
+                file(reply, "-2-thread")?;
+            }
+            None => file(&mut out, "")?,
+        }
+    }
+    for (file, gcode) in &written {
+        solidcraft_io::write_atomic(std::path::Path::new(file), gcode.as_bytes(), false).map_err(|e| crate::EngineError::Other(e.to_string()))?;
+    }
+    if let Some(reply) = thread_out {
+        out["thread"] = reply;
+    }
     if let Some(paths) = paths {
         out["paths"] = json!(paths);
     }
@@ -897,6 +1092,11 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     let doc = s.doc_mut();
     if new_tool {
         doc.cam.tools.push(tool);
+    }
+    if let (Some(mill), true) = (mill, new_mill) {
+        doc.cam.tools.push(mill);
+    }
+    if new_tool || new_mill {
         doc.cam.tools.sort_by_key(|t| t.number);
     }
     if new_setup {
@@ -904,6 +1104,33 @@ fn cut_out_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     }
     store_op(s, cmd, &setup_name, op)?;
     Ok(out)
+}
+
+/// What a part is cut from: what the caller named, else the newest sketch.
+fn part_geometry(s: &Session, cmd: &str, p: &Value) -> Result<CamGeometry> {
+    let mut source = if p.is_object() { p.clone() } else { json!({}) };
+    if !["sketch", "faces", "outer", "regions"].iter().any(|k| p.get(*k).is_some()) {
+        let id = newest_sketch(s).ok_or_else(|| bad(cmd, "draw the part's outline in a sketch first (or name `sketch`, `faces` or `outer`)"))?;
+        source["sketch"] = json!(id);
+    }
+    geometry_param(s, cmd, &source)
+}
+
+/// `cam.holes`: the round openings of a part, where a thread can be milled.
+fn holes_cmd(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.holes";
+    let setup_name = str_(p, "setup").map(str::trim).filter(|n| !n.is_empty() && n.len() <= 128).unwrap_or("Router");
+    let geometry = part_geometry(s, cmd, p)?;
+    // A setup that is not there yet is the one cam.cut_out would make: work zero at the sketch origin.
+    let setup = match s.doc.cam.setup(setup_name) {
+        Some(setup) => setup.clone(),
+        None => CamSetup::new(setup_name),
+    };
+    setup.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    let regions = resolve_geometry(s, &setup, &geometry).map_err(|e| bad(cmd, e))?;
+    let holes = round_holes(&regions).map_err(|e| bad(cmd, e.to_string()))?;
+    let told: Vec<Value> = holes.iter().map(|h| json!({"name": h.name, "at": [h.center.x, h.center.y], "diameter": h.diameter})).collect();
+    Ok(json!({"holes": told, "threads": THREADS.iter().map(|t| t.name).collect::<Vec<_>>()}))
 }
 
 /// A cutter of `kind` from `{prefix}diameter`, `{prefix}flutes` and `{prefix}flute_length`
@@ -1066,15 +1293,29 @@ fn carve_cmd(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
-/// The fastest a path cuts (mm/min).
+/// The fastest a path cuts (mm/min). A straight move down or up at one place is the way to a
+/// cut, not a cut (a thread mill goes down its bored hole faster than it mills): such moves
+/// count only in a path that has no others.
 fn top_feed(path: &solidcraft_cam::Toolpath) -> f64 {
-    path.moves
-        .iter()
-        .filter_map(|m| match m {
+    let mut at: Option<Vec3> = None;
+    let (mut across, mut any) = (0.0f64, 0.0f64);
+    for m in &path.moves {
+        let feed = match m {
             Move::Feed { feed, .. } | Move::Arc { feed, .. } | Move::PlaneArc { feed, .. } => Some(*feed),
             Move::Rapid { .. } | Move::Dwell { .. } => None,
-        })
-        .fold(0.0, f64::max)
+        };
+        if let Some(feed) = feed {
+            any = any.max(feed);
+            let vertical = matches!(m, Move::Feed { to, .. } if at.is_some_and(|a| (a.x - to.x).abs() < 1e-9 && (a.y - to.y).abs() < 1e-9));
+            if !vertical {
+                across = across.max(feed);
+            }
+        }
+        if let Some(to) = m.target() {
+            at = Some(to);
+        }
+    }
+    if across > 0.0 { across } else { any }
 }
 
 /// A length parameter: a number in mm, or an expression over the design's parameters and units.
@@ -1424,10 +1665,12 @@ fn setup_json(setup: &CamSetup) -> Value {
                 "type": "pocket", "name": name, "tool": tool, "geometry": geometry,
                 "params": params, "cut": cut, "spindle_rpm": spindle_rpm, "coolant": coolant,
             }),
-            CamOperation::Part { name, tool, geometry, material, thickness, tier, top, finish_stock, break_through, coolant, hold, pockets } => json!({
+            CamOperation::Part {
+                name, tool, geometry, material, thickness, tier, top, finish_stock, break_through, coolant, hold, pockets, threads, thread_tool, thread_fit,
+            } => json!({
                 "type": "part", "name": name, "tool": tool, "geometry": geometry, "material": material, "thickness": thickness,
                 "tier": tier, "top": top, "finish_stock": finish_stock, "break_through": break_through, "coolant": coolant, "hold": hold,
-                "pockets": pockets,
+                "pockets": pockets, "threads": threads, "thread_tool": thread_tool, "thread_fit": thread_fit,
             }),
         }).collect::<Vec<_>>(),
     })
@@ -1903,6 +2146,207 @@ mod tests {
             assert!(matches!(&e, crate::EngineError::BadParams { cmd, msg } if cmd == "cam.cut_out" && msg.contains(why)), "{params}: {e}");
             assert_eq!(s.doc.cam, before, "{params}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plate_with_a_thread_goes_to_two_checked_gcode_files() {
+        let mut s = Session::default();
+        let nothing = s.execute("cam.holes", &json!({})).unwrap_err().to_string();
+        assert!(nothing.contains("draw the part's outline in a sketch first"), "{nothing}");
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+        run(&mut s, "sketch.circle.center", json!({"center": [15, 20], "radius": 3.175}));
+        run(&mut s, "sketch.circle.center", json!({"center": [45, 20], "radius": 3.175}));
+        let sketch = s.active_sketch.expect("sketch");
+        run(&mut s, "sketch.finish", json!({}));
+        let name = s.doc.feature(sketch).unwrap().name.clone();
+
+        // The part's round holes, as the plan names them, in the setup's XY.
+        let before = s.doc.clone();
+        let listed = run(&mut s, "cam.holes", json!({"sketch": sketch}));
+        let holes = listed["holes"].as_array().unwrap();
+        assert_eq!(holes.len(), 2, "{listed}");
+        let mut seen: Vec<(String, f64, f64, f64)> = holes
+            .iter()
+            .map(|h| {
+                (h["name"].as_str().unwrap().to_owned(), h["at"][0].as_f64().unwrap(), h["at"][1].as_f64().unwrap(), h["diameter"].as_f64().unwrap())
+            })
+            .collect();
+        seen.sort_by(|a, b| a.1.total_cmp(&b.1));
+        assert!(seen[0].0.starts_with("Opening ") && seen[1].0.starts_with("Opening ") && seen[0].0 != seen[1].0, "{seen:?}");
+        for (got, want) in seen.iter().zip([(15.0, 20.0), (45.0, 20.0)]) {
+            assert!((got.1 - want.0).abs() < 1e-9 && (got.2 - want.1).abs() < 1e-9 && (got.3 - 6.35).abs() < 1e-9, "{seen:?}");
+        }
+        let offered: Vec<&str> = listed["threads"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(offered.len() == 12 && offered.contains(&"1/4-20") && offered.contains(&"M6"), "{offered:?}");
+        assert!(std::sync::Arc::ptr_eq(&s.doc, &before), "listing holes leaves the design alone");
+        // Without a sketch named it is the newest sketch's.
+        assert_eq!(run(&mut s, "cam.holes", json!({}))["holes"].as_array().map(Vec::len), Some(2));
+
+        let dir = std::env::temp_dir().join(format!("solidcraft-cam-thread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = |dir: &std::path::Path| {
+            let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        let ask = json!({
+            "sketch": sketch, "material": "aluminum", "thickness": 6, "tool_diameter": 3.175, "flute_length": 17,
+            "threads": [{"at": [45, 20], "thread": "1/4-20"}],
+            "thread_mill_diameter": "4.572 mm", "thread_mill_flutes": 3, "thread_mill_reach": 12, "thread_fit": "0.1 mm",
+            "paths": true,
+        });
+        // A dry run plans and checks both programs and keeps and writes nothing.
+        let mut dry = ask.clone();
+        dry["dry_run"] = json!(true);
+        dry["path"] = json!(dir.join("never.nc").to_string_lossy());
+        let tried = run(&mut s, "cam.cut_out", dry);
+        assert_eq!((tried["dry_run"].as_bool(), tried["thread"]["cuts"].as_array().map(Vec::len)), (Some(true), Some(1)), "{}", tried["thread"]);
+        assert!(tried["path"].is_null() && tried["thread"]["path"].is_null() && files(&dir).is_empty());
+        assert!(std::sync::Arc::ptr_eq(&s.doc, &before), "a dry run leaves the design alone");
+
+        let mut with_path = ask.clone();
+        with_path["path"] = json!(dir.join("plate.nc").to_string_lossy());
+        let out = run(&mut s, "cam.cut_out", with_path.clone());
+        // One file a cutter, in the order they are run; none under the bare name.
+        assert_eq!(files(&dir), ["plate-1-cut.nc", "plate-2-thread.nc"]);
+        assert!(out["path"].as_str().unwrap().ends_with("plate-1-cut.nc") && out["thread"]["path"].as_str().unwrap().ends_with("plate-2-thread.nc"));
+        let cut_text = std::fs::read_to_string(dir.join("plate-1-cut.nc")).unwrap();
+        let thread_text = std::fs::read_to_string(dir.join("plate-2-thread.nc")).unwrap();
+        assert_eq!((Some(cut_text.as_str()), Some(thread_text.as_str())), (out["gcode"].as_str(), out["thread"]["gcode"].as_str()));
+        // The first is the end mill's: the hole to thread is bored a pitch and 1 mm under the plate.
+        let cuts: Vec<&str> = out["cuts"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+        assert_eq!(cuts.len(), 6, "{cuts:?}");
+        assert!(cuts.iter().all(|c| !c.contains("Thread")) && cuts[5].ends_with("Outside finish"), "{cuts:?}");
+        assert!(cut_text.contains("Z-8.27") && !cut_text.contains("Thread") && cut_text.trim_end().ends_with("M30"), "{cut_text}");
+        assert_eq!((out["tool"]["number"].as_u64(), out["tool"]["kind"].as_str()), (Some(1), Some("flat_endmill")));
+        // The second is the thread mill's alone: counter-clockwise helical arcs up from below the plate.
+        let thread = &out["thread"];
+        assert_eq!(
+            (
+                thread["tool"]["number"].as_u64(),
+                thread["tool"]["kind"].as_str(),
+                thread["tool"]["diameter"].as_f64(),
+                thread["tool"]["flute_length"].as_f64(),
+                thread["tool"]["flutes"].as_u64()
+            ),
+            (Some(2), Some("thread_mill"), Some(4.572), Some(12.0), Some(3))
+        );
+        let milled = thread["cuts"].as_array().unwrap();
+        assert_eq!(milled.len(), 1);
+        assert_eq!((milled[0]["name"].as_str(), milled[0]["rpm"].as_f64()), (Some(format!("{name}: Thread 1/4-20, 1 hole").as_str()), Some(12000.0)));
+        assert!(milled[0]["feed"].as_f64().unwrap() > 100.0 && milled[0]["feed"].as_f64().unwrap() < 300.0, "{}", milled[0]);
+        assert!(thread_text.contains("S12000 M3") && thread_text.contains("G53 G0 Z-5") && thread_text.trim_end().ends_with("M30"), "{thread_text}");
+        assert!(thread_text.contains("Z-7.77") && thread_text.lines().any(|l| l.starts_with("G3 ") && l.contains(" Z")), "{thread_text}");
+        assert!(!thread_text.lines().any(|l| l.starts_with("G2 ") || l == "M0" || l.contains("M6")), "{thread_text}");
+        assert!(out["readback"]["within"].as_bool().unwrap() && thread["readback"]["within"].as_bool().unwrap());
+        assert!(thread["readback"]["cut_minutes"].as_f64().unwrap() > 0.05);
+        // It stays in the hole: the major radius less the tool's, and half the 0.1 mm fit.
+        let (lo, hi) = (&thread["extents"]["min"], &thread["extents"]["max"]);
+        for (got, want) in
+            [(&lo[0], 45.0 - 0.939), (&hi[0], 45.0 + 0.939), (&lo[1], 20.0 - 0.939), (&hi[1], 20.0 + 0.939), (&lo[2], -7.77), (&hi[2], 5.0)]
+        {
+            // The extents are of the path's chords, 0.05 mm off its arcs at most.
+            assert!((got.as_f64().unwrap() - want).abs() < 0.051, "{got} is not {want}: {}", thread["extents"]);
+        }
+        assert!(
+            thread["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("spoilboard"))),
+            "{}",
+            thread["issues"]
+        );
+        assert!(
+            !out["issues"].as_array().unwrap().iter().any(|i| i["message"].as_str().is_some_and(|m| m.contains("spoilboard"))),
+            "{}",
+            out["issues"]
+        );
+        // The paths to draw are both programs', the thread's last.
+        let paths = out["paths"].as_array().unwrap();
+        assert_eq!(paths.len(), 7);
+        assert!(paths[6]["name"].as_str().unwrap().contains("Thread"));
+        // Both cutters, and the choice, are kept with the part.
+        let cam = &s.doc.cam;
+        assert_eq!((cam.tools.len(), cam.setups.len(), cam.setups[0].operations.len()), (2, 1, 1));
+        let kept = run(&mut s, "cam.list", json!({}));
+        let op = &kept["setups"][0]["operations"][0];
+        assert_eq!(
+            (&op["threads"], &op["thread_tool"], &op["thread_fit"]),
+            (&json!([{"at": [45.0, 20.0], "thread": "1/4-20"}]), &json!(2), &json!("0.1 mm"))
+        );
+        // Asked again, nothing is added; the thread mill is found by its number too.
+        let mut again = ask.clone();
+        again["dry_run"] = json!(true);
+        again.as_object_mut().unwrap().retain(|k, _| !k.starts_with("thread_mill"));
+        again["thread_mill"] = json!(2);
+        assert_eq!(run(&mut s, "cam.cut_out", again)["thread"]["tool"]["number"].as_u64(), Some(2));
+        run(&mut s, "cam.cut_out", ask.clone());
+        assert_eq!((s.doc.cam.tools.len(), s.doc.cam.setups[0].operations.len()), (2, 1));
+        // The design reads back with the threads in it.
+        let saved = s.doc.to_json();
+        assert!(saved.contains("\"threads\"") && saved.contains("\"thread_tool\""), "{saved}");
+
+        // The setup posted whole puts the threads after the cuts, with the post's stop to change tools.
+        let posted = run(&mut s, "cam.post", json!({"setup": "Router"}));
+        let text = posted["gcode"].as_str().unwrap();
+        assert!(text.contains("Thread 1/4-20") && text.lines().any(|l| l == "M0"), "{text}");
+        // A part saved by cam.op.part plans its threads the same way.
+        let part = run(
+            &mut s,
+            "cam.op.part",
+            json!({"setup": "Router", "name": "Again", "tool": 1, "sketch": sketch, "material": "aluminum", "thickness": 6,
+                   "threads": [{"at": [15, 20], "thread": "M6"}], "thread_mill": 2}),
+        );
+        assert_eq!(part["cuts"].as_array().unwrap().last().and_then(Value::as_str), Some("Again: Thread M6, 1 hole"), "{part}");
+        run(&mut s, "cam.op.remove", json!({"setup": "Router", "name": "Again"}));
+
+        // What cannot be threaded as asked is refused before anything is written or kept.
+        let before = s.doc.cam.clone();
+        let written = files(&dir);
+        for (change, why) in [
+            (json!({"threads": [{"at": [40, 20], "thread": "1/4-20"}]}), "no round hole"),
+            (json!({"threads": [{"at": [45, 20], "thread": "M7"}]}), "unknown thread `M7`"),
+            (json!({"threads": [{"at": [45, 20]}]}), "`thread`"),
+            (json!({"threads": [{"at": [45], "thread": "M6"}]}), "`at`"),
+            (json!({"threads": [{"at": [45, "x"], "thread": "M6"}]}), "`at`"),
+            (json!({"threads": "all"}), "`threads` must be a list"),
+            (json!({"threads": [7]}), "each of `threads`"),
+            (json!({"thread_fit": "2 mm"}), "fit"),
+            (json!({"thread_mill_diameter": "5 mm"}), "does not fit"),
+            (json!({"thread_mill_reach": "7 mm"}), "reach"),
+            (json!({"thread_mill_flutes": 0}), "`thread_mill_flutes`"),
+            (json!({"thread_mill_diameter": null}), "give `thread_mill`"),
+            (json!({"thread_mill_diameter": null, "thread_mill": 1}), "not a thread mill"),
+            (json!({"thread_mill_diameter": null, "thread_mill": 9}), "no tool 9"),
+            (json!({"tool_diameter": 6}), "does not fit"),
+        ] {
+            let mut bad_ask = with_path.clone();
+            bad_ask["path"] = json!(dir.join("refused.nc").to_string_lossy());
+            for (k, v) in change.as_object().unwrap() {
+                bad_ask[k] = v.clone();
+            }
+            let e = s.execute("cam.cut_out", &bad_ask).unwrap_err().to_string();
+            assert!(e.contains(why), "{change}: {e}");
+            assert_eq!(s.doc.cam, before, "{change}");
+            assert_eq!(files(&dir), written, "{change}");
+        }
+        // 2000 threads are too many to keep.
+        let many: Vec<Value> = (0..501).map(|i| json!({"at": [f64::from(i), 0.0], "thread": "M6"})).collect();
+        let mut crowd = ask.clone();
+        crowd["threads"] = json!(many);
+        assert!(s.execute("cam.cut_out", &crowd).unwrap_err().to_string().contains("at most 500 threads"));
+
+        // Without threads asked again the part is kept without them, in one file under its own name.
+        let mut plain = json!({"sketch": sketch, "material": "aluminum", "thickness": 6, "tool": 1});
+        plain["path"] = json!(dir.join("plain.nc").to_string_lossy());
+        let out = run(&mut s, "cam.cut_out", plain);
+        assert!(out["thread"].is_null() && out["path"].as_str().unwrap().ends_with("plain.nc") && dir.join("plain.nc").exists());
+        assert!(!std::fs::read_to_string(dir.join("plain.nc")).unwrap().contains("Z-8.27"));
+        let kept = run(&mut s, "cam.list", json!({}));
+        assert_eq!((&kept["setups"][0]["operations"][0]["threads"], &kept["setups"][0]["operations"][0]["thread_tool"]), (&json!([]), &Value::Null));
+        // A thread mill can be defined as a tool of its own.
+        let defined = run(&mut s, "cam.tool.define", json!({"number": 7, "kind": "thread_mill", "diameter": 3.429, "flute_length": 12, "flutes": 3}));
+        assert_eq!(defined["tool"]["kind"].as_str(), Some("thread_mill"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
