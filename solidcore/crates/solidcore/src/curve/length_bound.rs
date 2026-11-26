@@ -5,9 +5,17 @@
 //! quadrature whose steps are accepted on an estimate, so it has no error bound; a caller
 //! that refuses on a length compares against this bracket instead.
 //!
-//! | Rust                    | Kind                                                     |
-//! |-------------------------|----------------------------------------------------------|
-//! | [`Curve::length_bound`] | a line, a circular arc, a B-spline (rational or not)     |
+//! | Rust                             | Kind                                              |
+//! |----------------------------------|---------------------------------------------------|
+//! | [`Curve::length_bound`]          | a line, a circular arc, a B-spline (rational or not) |
+//! | [`Curve::proved_length_at_most`] | the enclosure above, settled rather than narrowed |
+//!
+//! **Settling a limit.** [`Curve::proved_length_at_most`] asks the same enclosure whether the
+//! length is at most a limit, and it stops as soon as the pieces settle that: an enclosure whose
+//! lower end is past the limit proves the length is more than it, and one whose upper end is
+//! within it proves the length is at most. Asking [`Curve::length_bound`] for a bracket no wider
+//! than the limit instead answers the same, but a curve far longer than the limit never gets
+//! there: it halves to [`MAX_PIECES`] (a piece may carry no upper end at all) and is refused.
 //!
 //! **A line**: the distance between its ends, each known to `gamma_3` of its size (`P0 + t D`).
 //!
@@ -37,17 +45,28 @@
 //!
 //! **Rounding.** The points are taken in difference form, `w_s (P_s - P_0)` on a span (to
 //! `2u` relative by Kahan's products), so that their rounding scales with the span's size,
-//! not with its distance from the origin. A level of the blossom is `(1 - a) x + a y` with
-//! `a` formed from the knots: it moves a coordinate by at most `gamma_3 (1 + 6 K / S) 2 M`
-//! (`K` the largest knot, `S` the knot span's length, `M` the span's largest point or
-//! weight), and `p` levels by `p` times that, a weight's too in a polynomial span (weights
-//! 1), as its points are divided by the weights as computed. A blossomed weight is then at
-//! least `w_min`, the span's least less that rounding, and a Euclidean end is known to
-//! `(e + |X| e_w) / w_min` plus `gamma_2` of it; a chord to twice that times `sqrt3` plus
-//! `gamma_4` of itself, and its direction to the `asin` of that over its length. A
-//! coefficient of the cone is a combination of weight 1 of products of the points'
-//! differences and weights: its inputs' rounding carries in through the products, its own
-//! arithmetic to
+//! not with its distance from the origin. A level of the blossom is `z = (1 - a) x + a y`,
+//! `a = (u - l) / (h - l)` with `u` a piece's end and `l <= u <= h` knots (#14434): a piece
+//! lies within its knot span `[t_j, t_(j+1)]` (refused, named, if not), and every level's
+//! knots `l <= t_j`, `h >= t_(j+1)`, so `a` lies in `[0, 1]`. `u`, `l` and `h` are doubles,
+//! exact, so each of the two differences and the quotient rounds once relative to its own
+//! result: the computed `a` is within `gamma_3 a` of `a`, and `1 - a`, rounded once more,
+//! within `gamma_3 a (1 + u) + u (1 - a)` of `1 - a` (`u` here the unit roundoff). The two
+//! products and the sum add `gamma_2` of `|x| (1 - a) + |y| a`, so with `M` at least `|x|`
+//! and `|y|` a level with exact inputs is within `M (2 gamma_3 + u gamma_3) + gamma_2 M (1 +
+//! gamma_7) <= gamma_9 M` of `z` (`gamma_a + gamma_b + gamma_a gamma_b <= gamma_(a+b)`). Its
+//! inputs' errors `E` carry through the combination, whose coefficients are at most 1 and sum
+//! to 1, unamplified: `E_r <= (1 + gamma_9) E_(r-1) + gamma_9 M`, and `M` stays the span's
+//! largest point or weight (every level is a convex combination of the last). From the
+//! difference form's `E_0 = gamma_3 M`, the `p` levels give `E_p <= gamma_(9p+3) M` for a
+//! point, and from exact weights `gamma_(9p) w_max` for a weight, a polynomial span's
+//! (weights 1) too, as its points are divided by the weights as computed. (No term in the
+//! knots' size: no difference of them is formed from a rounded value.) A blossomed weight is
+//! then at least `w_min`, the span's least less that rounding, and a Euclidean end is known
+//! to `(e + |X| e_w) / w_min` plus `gamma_2` of it; a chord to twice that times `sqrt3` plus `gamma_4` of
+//! itself, and its direction to the `asin` of that over its length. A coefficient of the
+//! cone is a combination of weight 1 of products of the points' differences and weights:
+//! its inputs' rounding carries in through the products, its own arithmetic to
 //! `gamma_(4p + 8)` of its terms, and its direction to the `asin` of that over its length.
 //! The arc's ends are the curve's evaluation, known to `gamma_(16 (p + 2)) |P|` (a few ulps
 //! for each of the rational evaluation's operations), and `asin` and the
@@ -135,6 +154,172 @@ impl Curve {
                 reason: "no certified length for this curve kind",
             }),
         }
+    }
+
+    /// Not upstream: whether the arc length over `interval` is at most `limit`, certified,
+    /// stopping as soon as the enclosure settles it (module docs): `Some(true)`
+    /// where the length is proved at most `limit`, `Some(false)` where it is proved more.
+    ///
+    /// `most` bounds the work: a B-spline's pieces are halved at most that many times (and never
+    /// past [`MAX_PIECES`]). `None` where neither end settles it within that: a kind it does not
+    /// enclose (module docs), or a B-spline whose pieces reach `most` or whose widest piece is
+    /// mostly its own rounding. Never a guess: `None` is "no bound settles it here", so a caller
+    /// asks within the work it can spend and reads `None` as "not proved", never as "no".
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` for an interval or limit that is not finite, or a malformed curve; those
+    /// of the evaluations and the parameter conversions.
+    pub fn proved_length_at_most(
+        &self,
+        k: &Kernel,
+        interval: &Extent1d,
+        limit: f64,
+        most: usize,
+    ) -> Result<Option<bool>> {
+        let (a, b) = (interval.min(), interval.max());
+        if !(a.is_finite() && b.is_finite() && limit.is_finite() && limit >= 0.0) {
+            return Err(SolidError::invalid_input(
+                OP,
+                "an interval or limit not finite",
+            ));
+        }
+        if b - a <= 0.0 {
+            return Ok(Some(true));
+        }
+        let bracket = match self.kind() {
+            CurveKind::Line(_) => {
+                let (p, q) = (self.evaluate_point(k, a)?, self.evaluate_point(k, b)?);
+                // as `length_bound`'s line: one product and one sum per end
+                let e = gamma(3) * (1.0 + p.max_dimension().max(q.max_dimension()));
+                let chord = (q - p).length();
+                let slack = 2.0 * 3.0_f64.sqrt() * e + gamma(4) * chord;
+                Bracket {
+                    lower: (chord - slack).max(0.0),
+                    upper: chord + slack,
+                }
+            }
+            CurveKind::Ellipse(el) if el.is_circle() => {
+                arc_bound(k, self, el.base(), el.x_radius().max(el.y_radius()), a, b)?.0
+            }
+            CurveKind::Ellipse(el) => return spline_at_most(el.base(), a, b, limit, most),
+            CurveKind::BSpline(c) => return spline_at_most(c, a, b, limit, most),
+            CurveKind::Parabola(c) => return spline_at_most(c.base(), a, b, limit, most),
+            CurveKind::Hyperbola(c) => return spline_at_most(c.base(), a, b, limit, most),
+            _ => return Ok(None),
+        };
+        Ok(settles(bracket, limit))
+    }
+}
+
+impl Curve {
+    /// Not upstream (#17098): whether `self` over `interval` and `other` over
+    /// `other_interval` are proved within `budget` of each other: every point of each within
+    /// `budget` of a point of the other (their Hausdorff distance), rounding included.
+    ///
+    /// A curve of length at most `L` whose ends are `c` apart lies in the ellipse with its
+    /// ends as foci and major axis `L` (the sum of a point's distances to the ends is at most
+    /// the length through it), every point of which is within the semi-minor axis
+    /// `b = sqrt(L^2 - c^2) / 2` of the chord between the ends; and every point of the chord
+    /// is within `b` of the curve, which crosses the chord's normal plane there inside that
+    /// ellipse. So each curve is within its `b` of its chord, and the two chords, paired end
+    /// to end either way round, within the larger end distance of each other (the triangle
+    /// inequality along both segments). `L` is [`Curve::length_bound`]'s upper end, asked as
+    /// narrow as the budget needs; an end is a line's [`Line::segment_over`](crate::curve::line::Line::segment_over)
+    /// point, or an evaluated point within its degree's rounding (module docs). `false` when
+    /// no bound fits the budget: a kind without a certified length or end, a length bracket
+    /// that cannot be that narrow, or curves farther apart.
+    ///
+    /// # Errors
+    ///
+    /// Those of the evaluations; cancellation and unported callees of the length bound
+    /// (its refusals and unsupported kinds are `false`).
+    pub fn proved_within(
+        &self,
+        k: &Kernel,
+        interval: &Extent1d,
+        other: &Curve,
+        other_interval: &Extent1d,
+        budget: f64,
+    ) -> Result<bool> {
+        if !(budget.is_finite() && budget > 0.0) {
+            return Ok(false);
+        }
+        let (Some(a), Some(b)) = (
+            self.ends_with_rounding(k, interval)?,
+            other.ends_with_rounding(k, other_interval)?,
+        ) else {
+            return Ok(false);
+        };
+        let dist = |p: Vec3, q: Vec3| {
+            crate::nurbs::crv_deviation::norm_up(p.x - q.x, p.y - q.y, p.z - q.z)
+                .map(|d| d * (1.0 + gamma(2)))
+        };
+        let (Some(a0b0), Some(a1b1), Some(a0b1), Some(a1b0)) = (
+            dist(a.0, b.0),
+            dist(a.1, b.1),
+            dist(a.0, b.1),
+            dist(a.1, b.0),
+        ) else {
+            return Ok(false);
+        };
+        let ends = a0b0.max(a1b1).min(a0b1.max(a1b0)) + 2.0 * (a.2 + b.2);
+        // what is left of the budget for the two curves' distances to their chords
+        let room = (budget - ends) / (2.0 * (1.0 + gamma(4)));
+        if room.is_nan() || room <= 0.0 {
+            return Ok(false);
+        }
+        for (curve, ivl, (p, q, e)) in [(self, interval, a), (other, other_interval, b)] {
+            let Some(chord) = dist(p, q) else {
+                return Ok(false);
+            };
+            // the exact chord is at least the computed one less both ends' rounding
+            let chord = ((chord - 2.0 * e) * (1.0 - gamma(4))).max(0.0);
+            // the longest length whose semi-minor axis is `room`
+            let longest = (chord * chord + 4.0 * room * room).sqrt() * (1.0 - gamma(4));
+            let width = longest - chord;
+            if width.is_nan() || width <= 0.0 {
+                return Ok(false);
+            }
+            let upper = match curve.length_bound(k, ivl, width) {
+                Ok(bracket) => bracket.upper,
+                Err(err) if err.is_unported_or_cancelled() => return Err(err),
+                Err(_) => return Ok(false),
+            };
+            let semi_minor =
+                ((upper * upper - chord * chord).max(0.0)).sqrt() * 0.5 * (1.0 + gamma(4));
+            if semi_minor.is_nan() || semi_minor > room {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The ends of `self` over `interval` and how far each can be from the exact one: a
+    /// line's [`Line::segment_over`](crate::curve::line::Line::segment_over), the
+    /// B-spline-based kinds' evaluated ends within their degree's rounding; `None` for
+    /// another kind or a line end without a bound.
+    fn ends_with_rounding(
+        &self,
+        k: &Kernel,
+        interval: &Extent1d,
+    ) -> Result<Option<(Vec3, Vec3, f64)>> {
+        let degree = match self.kind() {
+            CurveKind::Line(l) => {
+                return Ok(l
+                    .segment_over(interval)
+                    .map(|[(p, ep), (q, eq)]| (p, q, ep.max(eq))));
+            }
+            CurveKind::Ellipse(el) => el.base().degree()?,
+            CurveKind::BSpline(c) => c.degree()?,
+            CurveKind::Parabola(c) => c.base().degree()?,
+            CurveKind::Hyperbola(c) => c.base().degree()?,
+            _ => return Ok(None),
+        };
+        let p = self.evaluate_point(k, interval.min())?;
+        let q = self.evaluate_point(k, interval.max())?;
+        let e = evaluation_rounding(degree, p.max_dimension().max(q.max_dimension()));
+        Ok(e.is_finite().then_some((p, q, e)))
     }
 }
 
@@ -234,10 +419,16 @@ struct H {
 /// The knot span `j` of a B-spline of degree `p` (rational or not): its control points in
 /// homogeneous difference form, `w_s (P_s - P_0)` and `w_s`, its local knots, and the
 /// rounding of the points and weights read off it by blossoming.
-struct Span {
+pub(crate) struct Span {
     p: usize,
+    /// The span's first control point `P_0`, Euclidean, which the difference form is taken
+    /// from.
+    origin: Vec3,
     /// The knots `t_(j-p+1) ..= t_(j+p)`.
     knots: Vec<f64>,
+    /// The knot span `[t_j, t_(j+1)]`: a piece within it is blossomed to the rounding bound.
+    start: f64,
+    end: f64,
     points: Vec<H>,
     /// The rounding of a homogeneous difference point read off the span (module docs).
     rounding: f64,
@@ -257,7 +448,8 @@ fn difference_of_products(a: f64, b: f64, c: f64, d: f64) -> f64 {
 }
 
 impl Span {
-    fn of(c: &BSplineCurve, mid: f64) -> Result<Self> {
+    /// The knot span of `c` that holds `mid`.
+    pub(crate) fn of(c: &BSplineCurve, mid: f64) -> Result<Self> {
         let p = c.degree()?;
         let cpts = c.control_points()?;
         let (unique, mult) = c.knots(None)?;
@@ -306,23 +498,20 @@ impl Span {
         let (w_min, w_max) = points.iter().fold((f64::INFINITY, 0.0_f64), |(lo, hi), h| {
             (lo.min(h.w), hi.max(h.w))
         });
-        let kmax = local.iter().fold(0.0_f64, |m, t| m.max(t.abs()));
-        // every level's knot difference spans the knot span [t_j, t_(j+1)]
-        let smin = match (local.get(p.wrapping_sub(1)), local.get(p)) {
-            (Some(x), Some(y)) => y - x,
-            _ => f64::NAN,
+        // the knot span [t_j, t_(j+1)]: every level's knots l <= t_j and h >= t_(j+1)
+        let (Some(&start), Some(&end)) = (local.get(p.wrapping_sub(1)), local.get(p)) else {
+            return Err(bad());
         };
-        if !(smin.is_finite() && smin > 0.0) {
+        if !(start.is_finite() && end.is_finite() && end > start) {
             return Err(bad());
         }
-        let levels = f64::from(u32::try_from(p).map_err(|_| bad())?);
-        // one level moves a coordinate by gamma_3 (1 + 6 K / S) 2 M; the difference form
-        // itself is within 3u of the size
-        let level = |m: f64| gamma(3) * (1.0 + 6.0 * kmax / smin) * 2.0 * m;
-        let rounding = levels * level(size) + gamma(3) * size;
+        // a level moves a coordinate by at most gamma_9 of the span's largest, p levels
+        // gamma_(9p), from the difference form's gamma_3 (module docs, #14434)
+        let levels = p.checked_mul(9).ok_or_else(bad)?;
+        let rounding = gamma(levels.checked_add(3).ok_or_else(bad)?) * size;
         // (a polynomial span's weights are 1, but blossomed to the same bound: its points
         // are divided by them as computed)
-        let rounding_w = levels * level(w_max);
+        let rounding_w = gamma(levels) * w_max;
         if !(rounding.is_finite() && rounding_w.is_finite()) {
             return Err(bad());
         }
@@ -332,7 +521,10 @@ impl Span {
         }
         Ok(Self {
             p,
+            origin: Vec3::new(c0.x / w0, c0.y / w0, z(&c0) / w0),
             knots: local,
+            start,
+            end,
             points,
             rounding,
             rounding_w,
@@ -382,9 +574,46 @@ impl Span {
             .collect()
     }
 
+    /// The Euclidean Bezier control points of the curve on `[a, b]` within this span, whose
+    /// convex hull holds the curve there, and the bound of each coordinate's rounding: the
+    /// blossomed difference point's and weight's through the division (as
+    /// [`Span::piece`]'s ends), and `gamma_2` of the point for the origin's own division and
+    /// the sum that puts it back. `None` for a piece outside the span or of no length,
+    /// where the rounding bound does not hold, and for numbers not finite.
+    pub(crate) fn hull(&self, a: f64, b: f64) -> Option<(Vec<Vec3>, f64)> {
+        if !(self.start <= a && a < b && b <= self.end) {
+            return None;
+        }
+        let pts = self.bezier(a, b);
+        let (e, ew, wl) = (self.rounding, self.rounding_w, self.w_min);
+        let size = pts.iter().fold(0.0_f64, |m, h| m.max(h.x.length() / h.w));
+        let from = self.origin;
+        let origin = from.x.abs().max(from.y.abs()).max(from.z.abs());
+        let rounding = (e + size * ew) / wl + gamma(2) * size + gamma(2) * (origin + size);
+        let out: Vec<Vec3> = pts.iter().map(|h| from + h.x * (1.0 / h.w)).collect();
+        let finite = rounding.is_finite()
+            && out
+                .iter()
+                .all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
+        finite.then_some((out, rounding))
+    }
+
     /// The bracket of the piece `[a, b]` (module docs): its chord `c`, and `c / cos phi`,
-    /// `phi` the widest angle between the chord and the hodograph's cone.
-    fn piece(&self, a: f64, b: f64) -> Piece {
+    /// `phi` the widest angle between the chord and the hodograph's cone. A piece outside
+    /// this span is refused, named: the rounding bound holds within it (module docs).
+    fn piece(&self, a: f64, b: f64) -> Result<Piece> {
+        if !(self.start <= a && a < b && b <= self.end) {
+            return Err(Failure::new(
+                OP,
+                CurveFailure::PieceOutsideSpan {
+                    a,
+                    b,
+                    span_start: self.start,
+                    span_end: self.end,
+                },
+            )
+            .into_error());
+        }
         let open = |lower: f64| Piece {
             a,
             b,
@@ -394,7 +623,7 @@ impl Span {
         };
         let pts = self.bezier(a, b);
         let (Some(&h0), Some(&h1)) = (pts.first(), pts.last()) else {
-            return open(0.0);
+            return Ok(open(0.0));
         };
         // the ends, Euclidean (from P_0), and their rounding
         let (e, ew, wl) = (self.rounding, self.rounding_w, self.w_min);
@@ -406,7 +635,7 @@ impl Span {
         let slack = 2.0 * 3.0_f64.sqrt() * e_point + gamma(4) * c;
         let lower = (c - slack).max(0.0);
         if c <= slack {
-            return open(lower);
+            return Ok(open(lower));
         }
         let unit = chord * (1.0 / c);
         // the chord's own direction to its rounding
@@ -475,31 +704,31 @@ impl Span {
             let len = v.length();
             let err = input + gamma(4 * p + 8) * terms;
             if len <= err {
-                return open(lower);
+                return Ok(open(lower));
             }
             let along = unit.dot(v);
             if along <= 0.0 {
-                return open(lower);
+                return Ok(open(lower));
             }
             // the angle to the chord as atan2 of its sine and cosine parts (an acos near 1
             // knows a small angle only to sqrt(eps)), widened by the coefficient's and the
             // chord's rounding
             let phi = unit.cross(v).length().atan2(along) + (err / len).min(1.0).asin() + du;
             if phi >= 0.5 * PI {
-                return open(lower);
+                return Ok(open(lower));
             }
             cos_phi = cos_phi.min(phi.cos());
         }
         if !(cos_phi.is_finite() && cos_phi > 0.0) {
-            return open(lower);
+            return Ok(open(lower));
         }
-        Piece {
+        Ok(Piece {
             a,
             b,
             lower,
             upper: (c + slack) / cos_phi * (1.0 + gamma(8)),
             geometric: c / cos_phi - c,
-        }
+        })
     }
 }
 
@@ -550,7 +779,7 @@ fn spline_bound(c: &BSplineCurve, a: f64, b: f64, width: f64) -> Result<Bracket>
             continue;
         }
         let span = Span::of(c, 0.5 * (lo + hi))?;
-        queue.push(Queued(spans.len(), span.piece(*lo, *hi)));
+        queue.push(Queued(spans.len(), span.piece(*lo, *hi)?));
         spans.push(span);
     }
     let mut done: Vec<Piece> = Vec::new();
@@ -587,8 +816,8 @@ fn spline_bound(c: &BSplineCurve, a: f64, b: f64, width: f64) -> Result<Bracket>
             done.push(piece);
             continue;
         }
-        queue.push(Queued(s, span.piece(piece.a, m)));
-        queue.push(Queued(s, span.piece(m, piece.b)));
+        queue.push(Queued(s, span.piece(piece.a, m)?));
+        queue.push(Queued(s, span.piece(m, piece.b)?));
         pieces += 1;
         halvings += 1;
     }
@@ -615,6 +844,86 @@ fn spline_bound(c: &BSplineCurve, a: f64, b: f64, width: f64) -> Result<Bracket>
         .into_error());
     }
     Ok(bracket)
+}
+
+/// Whether a B-spline's length over `[a, b]` is at most `limit`, settling as [`spline_bound`]
+/// halves but before it would narrow to the limit itself: every 64 halvings the pieces' bracket
+/// is asked whether it settles it ([`settles`]). A sliver's edge is a few µm long and its limit
+/// a tolerance above that, so an enclosure already settles it; an edge far longer than the limit
+/// is settled the other way by its lower end long before the halving cap, where narrowing to the
+/// limit would never arrive (module docs).
+fn spline_at_most(
+    c: &BSplineCurve,
+    a: f64,
+    b: f64,
+    limit: f64,
+    most: usize,
+) -> Result<Option<bool>> {
+    if c.degree()? == 0 {
+        return Err(SolidError::invalid_input(OP, "a B-spline of degree 0"));
+    }
+    let mut spans: Vec<Span> = Vec::new();
+    let mut queue = std::collections::BinaryHeap::new();
+    for w in breaks(c, a, b)?.windows(2) {
+        let [lo, hi] = w else { continue };
+        if hi <= lo {
+            continue;
+        }
+        let span = Span::of(c, 0.5 * (lo + hi))?;
+        queue.push(Queued(spans.len(), span.piece(*lo, *hi)?));
+        spans.push(span);
+    }
+    let mut done: Vec<Piece> = Vec::new();
+    let mut pieces = queue.len();
+    let mut halvings = 0usize;
+    let most = most.min(MAX_PIECES);
+    loop {
+        // the total is summed afresh every 64 halvings, as `spline_bound` keeps it
+        if halvings % 64 == 0 {
+            let all = queue.iter().map(|q| &q.1).chain(done.iter());
+            if let Some(bracket) = summed(all, queue.len() + done.len()) {
+                if let Some(settled) = settles(bracket, limit) {
+                    return Ok(Some(settled));
+                }
+            }
+        }
+        if pieces >= most {
+            return Ok(None);
+        }
+        let Some(Queued(s, piece)) = queue.pop() else {
+            return Ok(None);
+        };
+        // the widest piece is mostly rounding: halving it (or any other) widens the bracket
+        if piece.geometric <= (piece.upper - piece.lower) - piece.geometric {
+            return Ok(None);
+        }
+        let Some(span) = spans.get(s) else {
+            return Err(SolidError::invalid_input(OP, "a piece without its span"));
+        };
+        let m = 0.5 * (piece.a + piece.b);
+        if !(m > piece.a && m < piece.b) {
+            // halved to the parameter's resolution: kept as it is
+            done.push(piece);
+            continue;
+        }
+        queue.push(Queued(s, span.piece(piece.a, m)?));
+        queue.push(Queued(s, span.piece(m, piece.b)?));
+        pieces += 1;
+        halvings += 1;
+    }
+}
+
+/// What `bracket` settles about the length being at most `limit`, where it settles it: an upper
+/// end within the limit proves the length is at most it, a lower end past the limit that it is
+/// more. `None` where the limit lies strictly between them.
+fn settles(bracket: Bracket, limit: f64) -> Option<bool> {
+    if bracket.upper <= limit {
+        Some(true)
+    } else if bracket.lower > limit {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// The bracket the `n` pieces give: their sides summed, each sum to `gamma_(n+1)` of itself.
