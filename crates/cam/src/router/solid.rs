@@ -95,6 +95,12 @@ impl SolidCut {
     }
 }
 
+/// The finishing cutter's centre stops this much short of a full radius beyond the part. Exactly
+/// a radius out it only grazes the part's sides: whether it then rests on their top edge or
+/// falls past them to the floor would turn on rounding in the mesh, and a pass could dip to the
+/// floor and back beside a wall that is already cut.
+const FINISH_INSIDE: f64 = 0.02;
+
 /// How far beyond the part's sides the roughing cutter's centre goes (mm): the margin asked
 /// for, and at least what the cutter needs to stand beside the part with the finishing stock on.
 fn reach(rough: &Tool, cut: &SolidCut) -> f64 {
@@ -232,7 +238,7 @@ pub fn plan_solid(surface: &Surface, rough: &Tool, finish: Option<&Tool>, cut: &
             feeds: Feeds { cut: fine.feed, plunge: 0.5 * fine.ramp_feed },
             stepover,
             angle: 0.0,
-            boundary: rect(finisher.radius()),
+            boundary: rect((finisher.radius() - FINISH_INSIDE).max(0.0)),
             stock_to_leave: 0.0,
             step: 0.25 * finisher.diameter,
             tolerance: 0.01,

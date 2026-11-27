@@ -999,6 +999,9 @@ fn a_solid_is_roughed_walled_and_finished_without_cutting_into_it() {
     close(low[0], -15.5, 1e-6);
     close(low[1], -15.5, 1e-6);
     assert!(low[2] >= -15.5 - 1e-6);
+    // Beside the base the ball rests on the base's top edge (Z −7), its tip no more than its
+    // radius below that: it never falls past the edge to the floor.
+    assert!(low[2] >= -10.0 - 1e-6, "finishing dips to {}", low[2]);
     // The finishing passes are a tenth of the ball's diameter apart and go over the dome's top.
     let over: Vec<Vec3> = plan.operations[2].path.points(0.01).into_iter().filter(|(_, cutting)| *cutting).map(|(p, _)| p).collect();
     let mut rows: Vec<f64> = over.iter().map(|p| (p.y / 0.6).round()).collect();
