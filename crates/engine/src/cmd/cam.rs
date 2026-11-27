@@ -1630,7 +1630,7 @@ fn resolve_geometry(s: &Session, setup: &CamSetup, source: &CamGeometry) -> std:
                 let (index, ..) = solidcraft_doc::naming::face_on_body(body, &face.name, face.at_vec())
                     .ok_or_else(|| format!("its face on `{}` is gone", face.body))?;
                 let plane = body.body.planar_face(index).ok_or("a picked face is not planar")?;
-                let resolved = resolve_face_indices(&state, &plane, LinkKind::Project, &face.body, &[index]).map_err(|e| e.to_string())?;
+                let resolved = resolve_face_indices(&state, &plane, LinkKind::Project, &face.body, &[index], &Default::default(), None).map_err(|e| e.to_string())?;
                 let region = outline(&resolved.geom)?;
                 regions.extend(to_setup(&plane, &frame, &[region])?);
             }
